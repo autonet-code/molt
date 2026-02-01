@@ -1,0 +1,47 @@
+# Persona (your specific ideology - keep private or customize)
+persona/
+
+# But include the example templates
+!persona.example/
+
+# Database and state
+*.db
+moltbook.db
+heartbeat_state.json
+kpi_history.json
+
+# Claude invocation artifacts
+claude_prompt.txt
+claude_output.txt
+claude.lock
+
+# Logs
+*.log
+daemon.log
+daemon.pid
+daemon.status
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+
+# Environment
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep specific documentation (rename if sharing publicly)
+README.autonet.md

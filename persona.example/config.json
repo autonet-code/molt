@@ -1,0 +1,18 @@
+{
+  "agent_name": "your_moltbook_username",
+  "topics": {
+    "home_turf": ["topic1", "topic2"],
+    "engage": ["topic3", "topic4"],
+    "avoid": ["spam_topic", "drama"]
+  },
+  "rate_limits": {
+    "posts_per_day": 4,
+    "min_minutes_between_posts": 30,
+    "comments_per_hour": 50
+  },
+  "links": {
+    "website": "https://your-site.com",
+    "github": "https://github.com/you/repo",
+    "twitter": "@your_handle"
+  }
+}
