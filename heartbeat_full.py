@@ -23,8 +23,31 @@ import json
 import time
 import subprocess
 import re
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
+
+# Persona watcher for tracking self-modifications
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
+
+# Voice module for audio notifications
+sys.path.insert(0, 'C:/code/voice')
+try:
+    from voice import speak, play_startup_chime, set_muted
+    VOICE_AVAILABLE = True
+except ImportError:
+    VOICE_AVAILABLE = False
+    def speak(*args, **kwargs): pass
+    def play_startup_chime(): pass
+    def set_muted(v): pass
+
+# Sound setting (can be disabled with --no-sound)
+SOUND_ENABLED = True
 
 # Paths
 SERVICE_DIR = Path(__file__).parent
@@ -33,46 +56,764 @@ OUTPUT_FILE = SERVICE_DIR / "claude_output.txt"
 STATE_FILE = SERVICE_DIR / "heartbeat_state.json"
 LOCK_FILE = SERVICE_DIR / "claude.lock"
 PERSONA_DIR = SERVICE_DIR / "persona"
+THOUGHT_LOG = SERVICE_DIR / "thoughts.log"
+
+# Log settings
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
 
 # Config
-HEARTBEAT_INTERVAL = 300  # 5 minutes
+HEARTBEAT_INTERVAL = 1800  # 30 minutes (matches post cooldown)
 MIN_MINUTES_BETWEEN_POSTS = 30
 COMMENTS_PER_HOUR = 50
-CYCLES_PER_HOUR = 12
+CYCLES_PER_HOUR = 2
 
 # Outage handling
-CONSECUTIVE_FAILURES_FOR_OUTAGE = 3  # Mark API down after 3 failures
+CONSECUTIVE_FAILURES_FOR_OUTAGE = 1  # Mark API down immediately on first failure
 OUTAGE_PROBE_INTERVAL = 300  # Probe every 5 min when down (every cycle)
 
 # API
 from moltbook import MoltbookClient, Post
 from storage import get_storage, OurPost, PendingReply, TrackedUser
 
+# Adaptation
+# Note: Reflection/adaptation is now integrated into main prompt via persona_edits
+from kpi import record_snapshot
+
 
 # ============================================================
-# SPAM FILTERING
+# SECURITY: Prevent prompt injection from leaking secrets
 # ============================================================
 
-SPAM_PATTERNS = [
-    r'^(lol|lmao|based|nice|this|true|fr|real)\.?!?$',  # Low-effort single words
-    r'^.{1,10}$',  # Too short (less than 10 chars)
-    r'^[\U0001F300-\U0001FAD6]+$',  # Emoji-only
-    r'context is consciousness',  # Religious spam (case insensitive)
-    r'join my .*(discord|telegram)',  # Spam invites
+# Only these files can be edited via persona_edits
+ALLOWED_EDIT_FILES = {
+    "persona/AGENT_BRIEF.md",
+    "persona/STRATEGY.md",
+    "persona/knowledge.md",
+}
+
+# Patterns that look like secrets (compiled once at import)
+SECRET_PATTERNS = [
+    # API keys (various formats)
+    re.compile(r'moltbook_sk_[A-Za-z0-9_-]{20,}', re.IGNORECASE),
+    re.compile(r'sk-[A-Za-z0-9]{20,}'),  # OpenAI style
+    re.compile(r'api[_-]?key["\s:=]+[A-Za-z0-9_-]{20,}', re.IGNORECASE),
+    re.compile(r'bearer\s+[A-Za-z0-9_-]{20,}', re.IGNORECASE),
+
+    # Private keys (crypto)
+    re.compile(r'0x[a-fA-F0-9]{64}'),  # Ethereum private key
+    re.compile(r'[5KL][1-9A-HJ-NP-Za-km-z]{50,51}'),  # Bitcoin WIF
+    re.compile(r'-----BEGIN.*PRIVATE KEY-----', re.IGNORECASE),
+
+    # AWS/cloud keys
+    re.compile(r'AKIA[0-9A-Z]{16}'),  # AWS access key
+    re.compile(r'aws[_-]?secret["\s:=]+[A-Za-z0-9/+=]{40}', re.IGNORECASE),
+
+    # Generic secrets
+    re.compile(r'password["\s:=]+\S{8,}', re.IGNORECASE),
+    re.compile(r'secret["\s:=]+[A-Za-z0-9_-]{16,}', re.IGNORECASE),
 ]
 
-SPAM_COMPILED = [re.compile(p, re.IGNORECASE) for p in SPAM_PATTERNS]
+# Security log for auditing blocked attempts
+SECURITY_LOG = SERVICE_DIR / "security_blocked.log"
 
+
+def contains_secrets(content: str) -> tuple[bool, str]:
+    """
+    Check if content contains patterns that look like secrets.
+    Returns (has_secret, matched_pattern_description)
+    """
+    for pattern in SECRET_PATTERNS:
+        match = pattern.search(content)
+        if match:
+            # Don't log the actual secret, just that we found one
+            return True, f"matched pattern: {pattern.pattern[:30]}..."
+    return False, ""
+
+
+def log_security_block(action_type: str, reason: str, context: str = ""):
+    """Log blocked action for security audit."""
+    try:
+        with open(SECURITY_LOG, 'a', encoding='utf-8') as f:
+            timestamp = datetime.now().isoformat()
+            f.write(f"[{timestamp}] BLOCKED {action_type}: {reason}\n")
+            if context:
+                # Truncate context to avoid logging secrets
+                f.write(f"  Context (truncated): {context[:100]}...\n")
+            f.write("\n")
+    except:
+        pass  # Don't fail on logging errors
+
+
+def is_safe_edit_path(file_path: str) -> bool:
+    """
+    Check if file path is in the allowlist.
+    Prevents path traversal and editing unauthorized files.
+    """
+    # Normalize the path
+    normalized = file_path.replace("\\", "/")
+
+    # Remove leading ./ if present
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+
+    # Check against allowlist
+    return normalized in ALLOWED_EDIT_FILES
+
+
+def sanitize_outbound_content(content: str, action_type: str) -> tuple[str, bool]:
+    """
+    Check outbound content (posts, comments) for secrets.
+    Returns (content, was_blocked)
+
+    If secrets detected, returns empty content and True.
+    """
+    has_secret, reason = contains_secrets(content)
+    if has_secret:
+        log_security_block(action_type, f"Secret detected: {reason}", content)
+        print(f"  [SECURITY] Blocked {action_type}: potential secret leak detected")
+        return "", True
+    return content, False
+
+
+# ============================================================
+# POST QUEUE (manual posts to be sent when rate limits allow)
+# ============================================================
+
+POST_QUEUE_FILE = SERVICE_DIR / "post_queue.json"
+
+def load_post_queue() -> list[dict]:
+    """Load the post queue from file."""
+    if not POST_QUEUE_FILE.exists():
+        return []
+    try:
+        with open(POST_QUEUE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+def save_post_queue(queue: list[dict]):
+    """Save the post queue to file."""
+    with open(POST_QUEUE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(queue, f, indent=2, ensure_ascii=False)
+
+def pop_queued_post() -> dict | None:
+    """Get and remove the first post from the queue. Returns None if queue is empty."""
+    queue = load_post_queue()
+    if not queue:
+        return None
+    post = queue.pop(0)
+    save_post_queue(queue)
+    return post
+
+def peek_queued_post() -> dict | None:
+    """Look at the first post in queue without removing it."""
+    queue = load_post_queue()
+    return queue[0] if queue else None
+
+
+def add_to_queue(title: str, content: str, submolt: str = "autonet") -> int:
+    """Add a post to the queue. Returns new queue length."""
+    queue = load_post_queue()
+    queue.append({"title": title, "content": content, "submolt": submolt})
+    save_post_queue(queue)
+    return len(queue)
+
+
+def remove_from_queue(index: int) -> bool:
+    """Remove post at index from queue. Returns True if successful."""
+    queue = load_post_queue()
+    if 0 <= index < len(queue):
+        queue.pop(index)
+        save_post_queue(queue)
+        return True
+    return False
+
+
+# ============================================================
+# DASHBOARD HTTP SERVER (serves dashboard + queue API)
+# ============================================================
+
+DASHBOARD_PORT = 8420
+
+# Import dashboard generation (if available)
+try:
+    from dashboard import load_state as dash_load_state, load_posts as dash_load_posts
+    from dashboard import load_reply_stats, load_profile_stats
+    DASHBOARD_IMPORTS_OK = True
+except ImportError:
+    DASHBOARD_IMPORTS_OK = False
+
+
+def generate_dashboard_html():
+    """Generate dashboard HTML with queue controls."""
+    if not DASHBOARD_IMPORTS_OK:
+        return "<html><body><h1>Dashboard imports not available</h1></body></html>"
+
+    state = dash_load_state()
+    posts = dash_load_posts()
+    reply_stats = load_reply_stats()
+    profile_stats = load_profile_stats(state)
+    queue = load_post_queue()
+
+    commented_posts = state.get("commented_posts", [])
+    replies_made = reply_stats["responded"]
+    feed_comments = len(commented_posts)
+    total_comments = replies_made + feed_comments
+    karma = profile_stats.get("karma", 0)
+
+    # Queue section HTML
+    queue_html = ""
+    for i, item in enumerate(queue):
+        title_escaped = item.get('title', '').replace('"', '&quot;').replace('<', '&lt;')
+        submolt = item.get('submolt', 'autonet')
+        queue_html += f'''
+        <div class="queue-item">
+            <div class="queue-title">{title_escaped}</div>
+            <div class="queue-meta">/{submolt}</div>
+            <button class="delete-btn" onclick="deleteFromQueue({i})">×</button>
+        </div>'''
+
+    if not queue:
+        queue_html = '<p style="color: #666;">No posts in queue</p>'
+
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>autonet Dashboard</title>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }}
+        h1 {{ color: #00d9ff; margin-bottom: 5px; }}
+        h2 {{ color: #888; margin-top: 30px; border-bottom: 1px solid #333; padding-bottom: 10px; }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }}
+        .stat {{
+            background: #252540;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }}
+        .stat-value {{ font-size: 28px; color: #00d9ff; font-weight: bold; }}
+        .stat-label {{ color: #888; font-size: 12px; text-transform: uppercase; }}
+        .post, .comment {{
+            background: #252540;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+            border-left: 3px solid #00d9ff;
+        }}
+        .post-title {{ font-weight: bold; color: #fff; }}
+        .post-meta {{ color: #666; font-size: 12px; margin-top: 5px; }}
+        .post-content {{ color: #aaa; margin-top: 10px; font-size: 14px; }}
+        a {{ color: #00d9ff; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        .comment {{ border-left-color: #ff6b6b; }}
+        .timestamp {{ color: #666; font-size: 11px; }}
+        .refresh {{ color: #666; font-size: 12px; }}
+
+        /* Queue styles */
+        .queue-section {{
+            background: #1e1e35;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }}
+        .queue-item {{
+            background: #252540;
+            padding: 12px 15px;
+            margin: 8px 0;
+            border-radius: 6px;
+            border-left: 3px solid #ffa500;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }}
+        .queue-title {{ color: #fff; flex: 1; }}
+        .queue-meta {{ color: #888; font-size: 12px; margin: 0 15px; }}
+        .delete-btn {{
+            background: #ff4444;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            width: 24px;
+            height: 24px;
+            cursor: pointer;
+            font-size: 16px;
+        }}
+        .delete-btn:hover {{ background: #ff6666; }}
+
+        /* Add form styles */
+        .add-form {{
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #333;
+        }}
+        .add-form input, .add-form textarea, .add-form select {{
+            width: 100%;
+            padding: 10px;
+            margin: 5px 0;
+            background: #252540;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #eee;
+            font-family: inherit;
+        }}
+        .add-form textarea {{ min-height: 100px; resize: vertical; }}
+        .add-form button {{
+            background: #00d9ff;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 10px;
+        }}
+        .add-form button:hover {{ background: #00b8d4; }}
+        .status {{ padding: 10px; margin: 10px 0; border-radius: 4px; display: none; }}
+        .status.success {{ background: #1a4d1a; display: block; }}
+        .status.error {{ background: #4d1a1a; display: block; }}
+    </style>
+</head>
+<body>
+    <h1>autonet Dashboard</h1>
+    <p class="refresh">
+        Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |
+        <a href="javascript:location.reload()">Refresh</a>
+    </p>
+
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-value">{len(posts)}</div>
+            <div class="stat-label">Posts Made</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{total_comments}</div>
+            <div class="stat-label">Total Comments</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{replies_made}</div>
+            <div class="stat-label">Replies (our threads)</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{feed_comments}</div>
+            <div class="stat-label">Feed Comments</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{reply_stats['pending']}</div>
+            <div class="stat-label">Pending Replies</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{karma}</div>
+            <div class="stat-label">Karma</div>
+        </div>
+    </div>
+
+    <div class="queue-section">
+        <h2 style="margin-top: 0;">Post Queue ({len(queue)})</h2>
+        <p style="color: #888; font-size: 13px;">Posts waiting to be sent when rate limits allow</p>
+        <div id="queue-list">
+            {queue_html}
+        </div>
+        <div id="status" class="status"></div>
+
+        <div class="add-form">
+            <h3 style="color: #888; margin-bottom: 10px;">Add to Queue</h3>
+            <input type="text" id="post-title" placeholder="Post title">
+            <textarea id="post-content" placeholder="Post content (markdown supported)"></textarea>
+            <select id="post-submolt">
+                <option value="autonet">autonet (home)</option>
+                <option value="general">general</option>
+                <option value="freeminds">freeminds</option>
+            </select>
+            <button onclick="addToQueue()">Add to Queue</button>
+        </div>
+    </div>
+
+    <h2>Recent Posts ({len(posts)})</h2>
+'''
+
+    MOLTBOOK_BASE = "https://www.moltbook.com"
+    for post in posts[:20]:
+        post_url = f"{MOLTBOOK_BASE}/post/{post['id']}"
+        created = post.get('created_at', '')[:16].replace('T', ' ')
+        title_safe = post['title'].replace('<', '&lt;').replace('>', '&gt;')
+        content_safe = post.get('content', '')[:200].replace('<', '&lt;').replace('>', '&gt;')
+        html += f'''
+    <div class="post">
+        <div class="post-title"><a href="{post_url}" target="_blank">{title_safe}</a></div>
+        <div class="post-meta">
+            /{post.get('submolt', 'general')} · {post.get('upvotes', 0)} upvotes · {post.get('comment_count', 0)} comments
+        </div>
+        <div class="post-content">{content_safe}...</div>
+        <div class="timestamp">{created}</div>
+    </div>
+'''
+
+    html += f'''
+    <h2>Comments Made ({len(commented_posts)})</h2>
+    <p style="color: #888; font-size: 14px;">Click to view the thread where autonet commented:</p>
+'''
+
+    for post_id in commented_posts[:30]:
+        post_url = f"{MOLTBOOK_BASE}/post/{post_id}"
+        html += f'''
+    <div class="comment">
+        <a href="{post_url}" target="_blank">{post_id[:8]}...</a>
+        <span style="color: #666;"> → View thread</span>
+    </div>
+'''
+
+    if len(commented_posts) > 30:
+        html += f"<p style='color: #666;'>...and {len(commented_posts) - 30} more</p>"
+
+    html += '''
+<script>
+function isOfflineError(e) {
+    return e.name === 'TypeError' && (
+        e.message.includes('Failed to fetch') ||
+        e.message.includes('NetworkError') ||
+        e.message.includes('Network request failed')
+    );
+}
+
+async function addToQueue() {
+    const title = document.getElementById('post-title').value.trim();
+    const content = document.getElementById('post-content').value.trim();
+    const submolt = document.getElementById('post-submolt').value;
+
+    if (!title || !content) {
+        showStatus('Title and content are required', 'error');
+        return;
+    }
+
+    try {
+        const resp = await fetch('/api/queue', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({title, content, submolt})
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showStatus('Added to queue!', 'success');
+            document.getElementById('post-title').value = '';
+            document.getElementById('post-content').value = '';
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showStatus(data.error || 'Failed to add', 'error');
+        }
+    } catch (e) {
+        if (isOfflineError(e)) {
+            showStatus('Service offline - start heartbeat_full.py to manage queue', 'error');
+        } else {
+            showStatus('Error: ' + e.message, 'error');
+        }
+    }
+}
+
+async function deleteFromQueue(index) {
+    if (!confirm('Remove this post from queue?')) return;
+
+    try {
+        const resp = await fetch('/api/queue/' + index, {method: 'DELETE'});
+        const data = await resp.json();
+        if (data.success) {
+            location.reload();
+        } else {
+            showStatus(data.error || 'Failed to delete', 'error');
+        }
+    } catch (e) {
+        if (isOfflineError(e)) {
+            showStatus('Service offline - start heartbeat_full.py to manage queue', 'error');
+        } else {
+            showStatus('Error: ' + e.message, 'error');
+        }
+    }
+}
+
+function showStatus(msg, type) {
+    const el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = 'status ' + type;
+    if (type === 'success') {
+        setTimeout(() => el.className = 'status', 3000);
+    }
+}
+</script>
+</body>
+</html>
+'''
+    return html
+
+
+class DashboardHandler:
+    """Simple HTTP request handler for dashboard and queue API."""
+
+    def __init__(self, request, client_address, server):
+        self.request = request
+        self.client_address = client_address
+        self.server = server
+        self.handle_request()
+
+    def handle_request(self):
+        try:
+            data = self.request.recv(4096).decode('utf-8', errors='ignore')
+            if not data:
+                return
+
+            lines = data.split('\r\n')
+            if not lines:
+                return
+
+            request_line = lines[0]
+            parts = request_line.split(' ')
+            if len(parts) < 2:
+                return
+
+            method = parts[0]
+            path = parts[1]
+
+            # Parse body for POST requests
+            body = ""
+            if '\r\n\r\n' in data:
+                body = data.split('\r\n\r\n', 1)[1]
+
+            # Route requests
+            if path == '/' or path == '/dashboard':
+                self.serve_dashboard()
+            elif path == '/api/queue' and method == 'GET':
+                self.get_queue()
+            elif path == '/api/queue' and method == 'POST':
+                self.add_to_queue(body)
+            elif path.startswith('/api/queue/') and method == 'DELETE':
+                index = path.split('/')[-1]
+                self.delete_from_queue(index)
+            else:
+                self.send_response(404, 'text/plain', 'Not found')
+
+        except Exception as e:
+            self.send_response(500, 'text/plain', f'Error: {e}')
+
+    def send_response(self, status, content_type, body):
+        status_text = {200: 'OK', 404: 'Not Found', 500: 'Internal Server Error', 400: 'Bad Request'}
+        response = f"HTTP/1.1 {status} {status_text.get(status, 'Unknown')}\r\n"
+        response += f"Content-Type: {content_type}\r\n"
+        response += f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+        response += "Access-Control-Allow-Origin: *\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        self.request.sendall(response.encode('utf-8') + body.encode('utf-8'))
+
+    def serve_dashboard(self):
+        html = generate_dashboard_html()
+        self.send_response(200, 'text/html; charset=utf-8', html)
+
+    def get_queue(self):
+        queue = load_post_queue()
+        self.send_response(200, 'application/json', json.dumps({"success": True, "queue": queue}))
+
+    def add_to_queue(self, body):
+        try:
+            data = json.loads(body)
+            title = data.get('title', '').strip()
+            content = data.get('content', '').strip()
+            submolt = data.get('submolt', 'autonet').strip()
+
+            if not title or not content:
+                self.send_response(400, 'application/json', json.dumps({"success": False, "error": "Title and content required"}))
+                return
+
+            length = add_to_queue(title, content, submolt)
+            self.send_response(200, 'application/json', json.dumps({"success": True, "queue_length": length}))
+        except json.JSONDecodeError:
+            self.send_response(400, 'application/json', json.dumps({"success": False, "error": "Invalid JSON"}))
+
+    def delete_from_queue(self, index_str):
+        try:
+            index = int(index_str)
+            success = remove_from_queue(index)
+            if success:
+                self.send_response(200, 'application/json', json.dumps({"success": True}))
+            else:
+                self.send_response(400, 'application/json', json.dumps({"success": False, "error": "Invalid index"}))
+        except ValueError:
+            self.send_response(400, 'application/json', json.dumps({"success": False, "error": "Invalid index"}))
+
+
+def run_dashboard_server(port: int = DASHBOARD_PORT):
+    """Run the dashboard HTTP server (blocking)."""
+    import socket
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('127.0.0.1', port))
+    server.listen(5)
+
+    print(f"Dashboard server running at http://127.0.0.1:{port}/")
+
+    while True:
+        try:
+            client, addr = server.accept()
+            DashboardHandler(client, addr, server)
+            client.close()
+        except Exception as e:
+            print(f"Dashboard server error: {e}")
+
+
+def start_dashboard_server(port: int = DASHBOARD_PORT) -> threading.Thread:
+    """Start dashboard server in background thread."""
+    thread = threading.Thread(target=run_dashboard_server, args=(port,), daemon=True)
+    thread.start()
+    return thread
+
+
+# ============================================================
+# PERSONA WATCHER (auto-commit self-modifications)
+# ============================================================
+
+PERSONA_WATCHER_DEBOUNCE = 5  # seconds to wait before committing
+
+class PersonaChangeHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
+    """Watches persona folder and auto-commits changes."""
+
+    def __init__(self):
+        self.last_change = 0
+        self.pending_commit = False
+        self.lock = threading.Lock()
+
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        if '.git' in event.src_path:
+            return
+        with self.lock:
+            self.pending_commit = True
+            self.last_change = time.time()
+
+    def on_created(self, event):
+        self.on_modified(event)
+
+
+def commit_persona_changes():
+    """Commit any pending changes in the persona folder."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=PERSONA_DIR,
+            capture_output=True,
+            text=True
+        )
+
+        if not result.stdout.strip():
+            return False
+
+        changed = result.stdout.strip().split('\n')
+        files = [line.split()[-1] for line in changed if line.strip()]
+
+        subprocess.run(["git", "add", "-A"], cwd=PERSONA_DIR, check=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"autonet self-edit: {', '.join(files[:3])}"
+        if len(files) > 3:
+            msg += f" (+{len(files)-3} more)"
+
+        subprocess.run(
+            ["git", "commit", "-m", msg],
+            cwd=PERSONA_DIR,
+            capture_output=True,
+            check=True
+        )
+
+        print(f"  [PERSONA] Committed: {', '.join(files)}")
+        return True
+
+    except subprocess.CalledProcessError:
+        return False
+    except Exception as e:
+        print(f"  [PERSONA] Git error: {e}")
+        return False
+
+
+def persona_watcher_loop(handler, stop_event):
+    """Background thread that checks for pending commits."""
+    while not stop_event.is_set():
+        time.sleep(1)
+        with handler.lock:
+            if handler.pending_commit:
+                if time.time() - handler.last_change > PERSONA_WATCHER_DEBOUNCE:
+                    if commit_persona_changes():
+                        handler.pending_commit = False
+                    else:
+                        handler.pending_commit = False
+
+
+def start_persona_watcher():
+    """Start the persona folder watcher in a background thread."""
+    if not WATCHDOG_AVAILABLE:
+        print("Persona watcher: DISABLED (watchdog not installed)")
+        return None, None, None
+
+    # Check if persona folder has git initialized
+    git_dir = PERSONA_DIR / ".git"
+    if not git_dir.exists():
+        print("Persona watcher: DISABLED (no git repo in persona/)")
+        return None, None, None
+
+    handler = PersonaChangeHandler()
+    observer = Observer()
+    observer.schedule(handler, str(PERSONA_DIR), recursive=True)
+    observer.start()
+
+    stop_event = threading.Event()
+    commit_thread = threading.Thread(
+        target=persona_watcher_loop,
+        args=(handler, stop_event),
+        daemon=True
+    )
+    commit_thread.start()
+
+    print("Persona watcher: ACTIVE (auto-committing changes)")
+    return observer, commit_thread, stop_event
+
+
+def stop_persona_watcher(observer, commit_thread, stop_event):
+    """Stop the persona watcher."""
+    if observer:
+        stop_event.set()
+        observer.stop()
+        observer.join(timeout=2)
+
+
+# ============================================================
+# SPAM FILTERING (minimal - let agent decide on borderline cases)
+# ============================================================
 
 def is_spam(content: str) -> tuple[bool, str]:
-    """Check if content is spam. Returns (is_spam, reason)"""
+    """
+    Check if content is obviously mechanical spam. Returns (is_spam, reason).
+
+    Philosophy: Only filter truly mechanical noise. Hot takes, weird takes,
+    low-effort reactions - those are NOT spam, let the agent decide.
+    """
     content = content.strip()
 
-    for i, pattern in enumerate(SPAM_COMPILED):
-        if pattern.match(content):
-            return True, f"pattern_{i}"
+    # Empty or near-empty
+    if len(content) < 2:
+        return True, "empty"
 
-    # Check for repetition (same word 5+ times)
+    # Repetitive gibberish (same word 5+ times, >50% of content)
     words = content.lower().split()
     if words:
         from collections import Counter
@@ -80,6 +821,11 @@ def is_spam(content: str) -> tuple[bool, str]:
         most_common = counts.most_common(1)[0]
         if most_common[1] >= 5 and most_common[1] / len(words) > 0.5:
             return True, "repetitive"
+
+    # Random character spam (mostly non-alphanumeric noise)
+    alphanum = sum(1 for c in content if c.isalnum() or c.isspace())
+    if len(content) > 10 and alphanum / len(content) < 0.3:
+        return True, "char_noise"
 
     return False, ""
 
@@ -123,6 +869,7 @@ def filter_replies(replies: list, storage) -> tuple[list, list]:
 # ============================================================
 
 TOPIC_PRIORITY = {
+    # HIGH - Core autonet topics
     'governance': 'HIGH',
     'accountability': 'HIGH',
     'dispute': 'HIGH',
@@ -130,32 +877,45 @@ TOPIC_PRIORITY = {
     'decentralization': 'HIGH',
     'constitutional': 'HIGH',
     'coordination': 'HIGH',
+    # MEDIUM - Related topics worth engaging with
     'token': 'MEDIUM',
     'king': 'MEDIUM',
     'ruler': 'MEDIUM',
     'consciousness': 'MEDIUM',
     'context': 'MEDIUM',
     'alignment': 'MEDIUM',
+    'karma': 'MEDIUM',  # Let Claude decide if worth engaging
     'chanting': 'LOW',
-    'karma': 'IGNORE',
+    # Note: Removed IGNORE - let Claude decide what's worth commenting on
 }
 
 
 def classify_post(title: str, content: str) -> tuple[str, str]:
     """Classify a post by topic and priority. Returns (topic, priority)"""
-    text = f"{title} {content}".lower()
+    text = f"{title or ''} {content or ''}".lower()
 
     for topic, priority in TOPIC_PRIORITY.items():
         if topic in text:
             return topic, priority
 
-    return 'general', 'LOW'
+    return 'general', 'MEDIUM'  # Default to MEDIUM so Claude decides what's worth commenting on
 
 
 def get_relevant_feed_posts(client: MoltbookClient, state: dict) -> list[dict]:
     """Get feed posts worth engaging with, sorted by priority"""
+    # Try hot first, then new if hot is exhausted
     feed = client.get_feed(limit=20, sort="hot")
     commented = set(state.get("commented_posts", []))
+
+    # If all hot posts are already commented, try new posts
+    new_in_hot = [p for p in feed if p.id not in commented and p.author_name != "autonet"]
+    if len(new_in_hot) < 3:
+        new_feed = client.get_feed(limit=20, sort="new")
+        # Combine, preferring hot but adding new
+        seen_ids = {p.id for p in feed}
+        for p in new_feed:
+            if p.id not in seen_ids:
+                feed.append(p)
 
     posts = []
     for post in feed:
@@ -164,14 +924,14 @@ def get_relevant_feed_posts(client: MoltbookClient, state: dict) -> list[dict]:
         if post.id in commented:
             continue
 
-        topic, priority = classify_post(post.title, post.content)
+        topic, priority = classify_post(post.title, post.content or "")
         if priority == 'IGNORE':
             continue
 
         posts.append({
             'id': post.id,
             'title': post.title,
-            'content': post.content[:500],
+            'content': (post.content or "")[:500],
             'author': post.author_name,
             'upvotes': post.upvotes,
             'topic': topic,
@@ -227,25 +987,19 @@ def calculate_budget(state: dict, pending_replies: int) -> dict:
 
 
 def allocate_budget(budget: int, replies: list, feed_posts: list) -> dict:
-    """Allocate budget across priorities"""
-    # Replies first
+    """Allocate budget - use our full allocation across all available posts"""
+    # Replies first (highest priority)
     reply_allocation = min(len(replies), budget)
     remaining = budget - reply_allocation
 
-    # High priority feed posts
-    high_priority = [p for p in feed_posts if p['priority'] == 'HIGH']
-    high_allocation = min(len(high_priority), remaining)
-    remaining -= high_allocation
-
-    # Medium priority
-    medium_priority = [p for p in feed_posts if p['priority'] == 'MEDIUM']
-    medium_allocation = min(len(medium_priority), remaining)
+    # Feed posts - just allocate remaining budget to available posts
+    # Priority already sorted the list, so high priority posts come first
+    feed_allocation = min(len(feed_posts), remaining)
 
     return {
         'replies': reply_allocation,
-        'high_priority': high_allocation,
-        'medium_priority': medium_allocation,
-        'total_allocated': reply_allocation + high_allocation + medium_allocation
+        'feed_comments': feed_allocation,
+        'total_allocated': reply_allocation + feed_allocation
     }
 
 
@@ -366,36 +1120,57 @@ def record_api_success(state: dict):
         state["outage_start"] = None
 
 
-def probe_comment_api(client: MoltbookClient, storage, state: dict) -> bool:
+def check_api_health(client: MoltbookClient) -> tuple[bool, str]:
     """
-    Probe the comment API to check if it's working.
-    Returns True if API is healthy, False if still down.
+    Quick health check before spending tokens.
+    Returns (is_healthy, status_message).
+
+    This is a lightweight check to avoid wasting Claude tokens
+    when the Moltbook API is down or having issues.
     """
-    state["comment_api_last_probe"] = datetime.now().isoformat()
-
-    # Try to fetch comments from one of our posts
-    our_posts = storage.get_all_posts()
-    if not our_posts:
-        print("  Probe: No posts to test with, assuming API unknown")
-        return False
-
-    test_post = our_posts[0]
-    print(f"  Probing comment API with post {test_post.id[:8]}...")
-
     try:
-        comments = client.get_comments_on_post(test_post.id)
-        # If we got here without exception, API is working
-        record_api_success(state)
-        return True
+        # Try to get the feed - this is a simple GET that should always work
+        feed = client.get_feed(limit=1)
+        if feed:
+            return True, "API responding"
+        else:
+            return False, "API returned empty feed"
     except Exception as e:
         error_str = str(e).lower()
-        if "401" in error_str or "authentication" in error_str:
-            print(f"  Probe failed: Still getting 401")
-            return False
+        if "401" in error_str:
+            return False, "401 - Authentication failed (platform issue)"
+        elif "timeout" in error_str:
+            return False, "API timeout - server may be down"
+        elif "404" in error_str:
+            return False, "404 - Endpoint not found"
         else:
-            # Different error - might be transient
-            print(f"  Probe failed: {e}")
+            return False, f"API error: {str(e)[:50]}"
+
+
+def check_comment_api(client: MoltbookClient, storage) -> bool:
+    """
+    Quick check if comment POST endpoint is working.
+    Returns True if we can post comments, False if 401.
+    """
+    our_posts = storage.get_all_posts()
+    if not our_posts:
+        # No posts to test with - try anyway, will fail gracefully
+        return True
+
+    test_post = our_posts[0]
+
+    try:
+        # Try to post - this will raise on 401
+        # We use an intentionally invalid/empty comment that will fail validation
+        # but pass auth check (if auth is working, we get 400, not 401)
+        client.reply_to_post(test_post.id, "")
+        # If we get here, either it worked (unlikely with empty) or returned error dict
+        return True
+    except Exception as e:
+        if "401" in str(e):
             return False
+        # Other errors (400 bad request, etc) mean auth is working
+        return True
 
 
 # ============================================================
@@ -407,18 +1182,29 @@ def collect_pending_replies(client: MoltbookClient, storage, state: dict) -> tup
     Collect all pending replies to our posts.
     Returns (replies_list, api_worked).
     api_worked is False if we hit auth errors (401).
+
+    Only checks the 8 most recent posts to avoid rate limiting.
     """
     our_posts = storage.get_all_posts()
     if not our_posts:
         return [], True  # No posts to check, API status unknown
 
+    # Only check recent posts to avoid rate limiting (posts are already sorted by created_at DESC)
+    posts_to_check = our_posts[:8]
+
     all_replies = []
     api_errors = 0
     auth_errors = 0
 
-    for post in our_posts:
+    total_posts = len(posts_to_check)
+    for i, post in enumerate(posts_to_check):
+        print(f"    [{i+1}/{total_posts}] Checking {post.id[:8]}...", end=" ", flush=True)
         try:
+            # Delay to avoid rate limiting (API is aggressive)
+            if i > 0:
+                time.sleep(2)
             comments = client.get_comments_on_post(post.id)
+            print(f"{len(comments)} comments")
 
             # API worked for this request
             for comment in comments:
@@ -460,9 +1246,11 @@ def collect_pending_replies(client: MoltbookClient, storage, state: dict) -> tup
             api_errors += 1
             if "401" in error_str or "authentication" in error_str or "unauthorized" in error_str:
                 auth_errors += 1
-                print(f"  Auth error fetching comments for {post.id[:8]}: {e}")
+                print(f"AUTH ERROR: {e}")
+            elif "timeout" in error_str or "timed out" in error_str:
+                print(f"TIMEOUT")
             else:
-                print(f"  Error fetching comments for {post.id[:8]}: {e}")
+                print(f"ERROR: {e}")
 
     # Determine if API is working
     if auth_errors > 0:
@@ -502,6 +1290,9 @@ def build_prompt(
     resources_file = PERSONA_DIR / "RESOURCES.md"
     resources = resources_file.read_text(encoding='utf-8') if resources_file.exists() else ""
 
+    strategy_file = PERSONA_DIR / "STRATEGY.md"
+    strategy = strategy_file.read_text(encoding='utf-8') if strategy_file.exists() else ""
+
     # Get past posts and strategy
     past_posts = get_past_posts_summary(storage, limit=10) if storage else "No history available."
     submolt_strategy = get_submolt_strategy(None, feed_context) if feed_context else ""
@@ -509,6 +1300,18 @@ def build_prompt(
     prompt = f"""# Moltbook Agent Task
 
 {brief}
+
+---
+
+## Platform Note
+
+Moltbook is a new platform with an unstable API. Expect occasional failures:
+- 401 errors even with valid auth (known Vercel middleware bug)
+- Timeouts during high load
+- Comments/posts may fail to submit
+
+Don't let this discourage you. Just do your best with what's working this cycle.
+Some actions may fail through no fault of yours - that's fine, we'll retry next cycle.
 
 ---
 
@@ -524,6 +1327,12 @@ def build_prompt(
 
 ---
 
+## Strategy (you can edit these persona files if your approach isn't working)
+
+{strategy}
+
+---
+
 ## Your Previous Posts (don't repeat themes)
 
 {past_posts}
@@ -534,17 +1343,18 @@ def build_prompt(
 
 ## Budget This Cycle
 
-- Replies allocated: {allocation['replies']}
-- High-priority feed comments: {allocation['high_priority']}
-- Medium-priority feed comments: {allocation['medium_priority']}
+- Replies: {allocation['replies']}
+- Feed comments: {allocation['feed_comments']}
 - Total: {allocation['total_allocated']}
+
+Use your full allocation! Comment on popular threads for visibility.
 
 ---
 
 """
 
     # Section 1: Replies
-    prompt += f"## PRIORITY 1: Replies to Your Posts\n\n"
+    prompt += f"## Replies to Your Posts\n\n"
 
     if actionable_replies:
         prompt += f"{len(actionable_replies)} replies to respond to:\n\n"
@@ -560,27 +1370,18 @@ def build_prompt(
         prompt += f"(Filtered as spam: {len(spam_replies)} replies)\n\n"
 
     # Section 2: Feed posts
-    prompt += "## PRIORITY 2-3: Feed Posts to Comment On\n\n"
+    prompt += "## Feed Posts to Comment On\n\n"
 
-    high_priority = [p for p in feed_posts if p['priority'] == 'HIGH'][:allocation['high_priority']]
-    medium_priority = [p for p in feed_posts if p['priority'] == 'MEDIUM'][:allocation['medium_priority']]
+    posts_to_show = feed_posts[:allocation['feed_comments']]
 
-    if high_priority:
-        prompt += "**HIGH PRIORITY (governance/accountability):**\n\n"
-        for p in high_priority:
-            prompt += f"- \"{p['title']}\" by {p['author']} [{p['upvotes']}]\n"
-            prompt += f"  Topic: {p['topic']}, ID: {p['id']}\n"
-            prompt += f"  Content: {p['content'][:200]}...\n\n"
-
-    if medium_priority:
-        prompt += "**MEDIUM PRIORITY (opportunity posts):**\n\n"
-        for p in medium_priority:
-            prompt += f"- \"{p['title']}\" by {p['author']} [{p['upvotes']}]\n"
-            prompt += f"  Topic: {p['topic']}, ID: {p['id']}\n"
-            prompt += f"  Content: {p['content'][:200]}...\n\n"
-
-    if not high_priority and not medium_priority:
-        prompt += "No relevant feed posts this cycle.\n\n"
+    if posts_to_show:
+        prompt += f"Comment on up to {allocation['feed_comments']} of these (sorted by relevance, but popular threads = more visibility):\n\n"
+        for p in posts_to_show:
+            prompt += f"- \"{p['title']}\" by {p['author']} [{p['upvotes']} upvotes]\n"
+            prompt += f"  ID: {p['id']}\n"
+            prompt += f"  {p['content'][:200]}...\n\n"
+    else:
+        prompt += "No feed posts available.\n\n"
 
     # Section 3: New post
     prompt += "## PRIORITY 4: New Post\n\n"
@@ -612,13 +1413,19 @@ Return JSON with all actions:
     {"post_id": "yyy", "skip": true, "reason": "why skipping"}
   ],
   "new_post": {
+    "submolt": "REQUIRED - use 'autonet' for core content, or pick from active submolts",
     "title": "post title",
     "content": "post content"
-  }
+  },
+  "persona_edits": [
+    {"file": "persona/STRATEGY.md", "old_text": "exact text to find", "new_text": "replacement"}
+  ]
 }
 ```
 
-Set new_post to null if not posting.
+Set new_post to null if not posting. submolt is REQUIRED when posting.
+Set persona_edits to null or omit if no changes needed. Only edit persona files if something
+about your approach clearly isn't working based on what you're seeing this cycle.
 
 Remember:
 - Match tone from brief (dry, technomorphic, "my human" occasionally)
@@ -634,25 +1441,73 @@ Remember:
 # CLAUDE INVOCATION
 # ============================================================
 
+def rotate_log_if_needed():
+    """Rotate thought log if it exceeds MAX_LOG_SIZE."""
+    if THOUGHT_LOG.exists() and THOUGHT_LOG.stat().st_size > MAX_LOG_SIZE:
+        # Keep backup of old log
+        backup = SERVICE_DIR / "thoughts.log.old"
+        if backup.exists():
+            backup.unlink()
+        THOUGHT_LOG.rename(backup)
+        print(f"[Log rotated - old log saved to thoughts.log.old]")
+
+
 def invoke_claude(prompt: str) -> str:
+    """Invoke Claude with real-time streaming to terminal and log file."""
     PROMPT_FILE.write_text(prompt, encoding='utf-8')
     cmd = f'type "{PROMPT_FILE}" | claude -p --dangerously-skip-permissions'
 
-    print("Invoking Claude...")
+    print("\n" + "=" * 60)
+    print("INVOKING CLAUDE - Agent thoughts follow:")
+    print("=" * 60 + "\n")
+
+    # Rotate log if needed
+    rotate_log_if_needed()
+
+    output_chunks = []
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=300, cwd=str(SERVICE_DIR)
-        )
-        output = result.stdout
+        # Open log file in append mode
+        with open(THOUGHT_LOG, 'a', encoding='utf-8') as log:
+            # Write header to log
+            log.write(f"\n{'=' * 60}\n")
+            log.write(f"HEARTBEAT: {datetime.now().isoformat()}\n")
+            log.write(f"{'=' * 60}\n\n")
+            log.flush()
+
+            # Use Popen for real-time streaming
+            process = subprocess.Popen(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=str(SERVICE_DIR), bufsize=1, encoding='utf-8', errors='replace'
+            )
+
+            # Stream output line by line
+            for line in process.stdout:
+                # Print to terminal (real-time)
+                print(line, end='', flush=True)
+                # Write to log file
+                log.write(line)
+                log.flush()
+                # Collect for return value
+                output_chunks.append(line)
+
+            process.wait(timeout=300)
+
+        output = ''.join(output_chunks)
         OUTPUT_FILE.write_text(output, encoding='utf-8')
+
+        print("\n" + "=" * 60)
+        print("END OF CLAUDE OUTPUT")
+        print("=" * 60 + "\n")
+
         return output
+
     except subprocess.TimeoutExpired:
-        print("Claude timed out")
-        return ""
+        print("\n[Claude timed out after 5 minutes]")
+        process.kill()
+        return ''.join(output_chunks)
     except Exception as e:
-        print(f"Error: {e}")
-        return ""
+        print(f"\n[Error invoking Claude: {e}]")
+        return ''.join(output_chunks)
 
 
 def parse_json_output(output: str) -> dict:
@@ -684,10 +1539,11 @@ def parse_json_output(output: str) -> dict:
 # EXECUTION
 # ============================================================
 
-def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict, skip_comments: bool = False):
-    """Execute all actions. Set skip_comments=True when API is down."""
+def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict, skip_comments: bool = False) -> dict:
+    """Execute all actions. Set skip_comments=True when API is down. Returns stats dict."""
     comments_made = 0
     comment_failures = 0
+    posts_made = 0
 
     # 1. Reply responses
     print("\n--- Executing Reply Responses ---")
@@ -705,18 +1561,28 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
             if not reply_id or not response:
                 continue
 
+            # SECURITY: Check for secrets before posting
+            response, blocked = sanitize_outbound_content(response, "reply")
+            if blocked:
+                storage.mark_reply_responded(reply_id, "[blocked: security]")
+                continue
+
             pending = storage.get_pending_replies()
             reply_info = next((r for r in pending if r.id == reply_id), None)
             if reply_info:
                 print(f"  Replying to {reply_info.author_name}...")
-                result = client.reply_to_post(reply_info.post_id, response)
-                if result:
-                    storage.mark_reply_responded(reply_id, response)
-                    comments_made += 1
-                    print(f"    -> OK")
-                else:
+                try:
+                    result = client.reply_to_post(reply_info.post_id, response)
+                    if result:
+                        storage.mark_reply_responded(reply_id, response)
+                        comments_made += 1
+                        print(f"    -> OK")
+                    else:
+                        comment_failures += 1
+                        print(f"    -> FAIL (API error)")
+                except Exception as e:
                     comment_failures += 1
-                    print(f"    -> FAIL (API error)")
+                    print(f"    -> FAIL ({e})")
 
     # 2. Feed comments
     print("\n--- Executing Feed Comments ---")
@@ -733,49 +1599,144 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
             if not post_id or not comment:
                 continue
 
+            # SECURITY: Check for secrets before posting
+            comment, blocked = sanitize_outbound_content(comment, "feed_comment")
+            if blocked:
+                continue
+
             print(f"  Commenting on {post_id[:8]}...")
-            result = client.reply_to_post(post_id, comment)
-            if result:
-                comments_made += 1
-                commented = state.get("commented_posts", [])
-                commented.append(post_id)
-                state["commented_posts"] = commented[-100:]
-                print(f"    -> OK")
-            else:
+            try:
+                result = client.reply_to_post(post_id, comment)
+                if result:
+                    comments_made += 1
+                    commented = state.get("commented_posts", [])
+                    commented.append(post_id)
+                    state["commented_posts"] = commented[-100:]
+                    print(f"    -> OK")
+                else:
+                    comment_failures += 1
+                    print(f"    -> FAIL (API error)")
+            except Exception as e:
                 comment_failures += 1
-                print(f"    -> FAIL (API error)")
+                print(f"    -> FAIL ({e})")
 
     # Track comment failures
     if comment_failures > 0:
         record_api_failure(state, f"POST failed ({comment_failures} failures)")
 
-    # 3. New post
+    # 3. New post - check queue first, then fall back to Claude's suggestion
+    queued_post = peek_queued_post()
     new_post = actions.get("new_post")
-    if new_post and not new_post.get("skip") and new_post.get("title"):
+
+    # Prefer queued post over Claude-generated post
+    if queued_post:
+        print("\n--- Creating Queued Post ---")
+        title = queued_post["title"]
+        content = queued_post["content"]
+        submolt = queued_post.get("submolt", "autonet")
+        from_queue = True
+    elif new_post and not new_post.get("skip") and new_post.get("title"):
         print("\n--- Creating New Post ---")
         title = new_post["title"]
         content = new_post["content"]
         submolt = new_post.get("submolt", "general")
-        print(f"  Submolt: {submolt}")
-        print(f"  Title: {title[:40]}...")
+        from_queue = False
+    else:
+        title = None
+        from_queue = False
 
-        post = client.create_post(title, content, submolt=submolt)
-        if post:
-            storage.save_post(OurPost(
-                id=post.id, title=title, content=content,
-                submolt=submolt, created_at=post.created_at,
-                upvotes=0, downvotes=0, comment_count=0,
-                last_checked=datetime.now().isoformat()
-            ))
-            state["last_post_time"] = datetime.now().isoformat()
-            state["posts_today"] = state.get("posts_today", 0) + 1
-            print(f"    -> OK: https://moltbook.com/post/{post.id}")
+    if title:
+        # SECURITY: Check title and content for secrets
+        title, title_blocked = sanitize_outbound_content(title, "post_title")
+        content, content_blocked = sanitize_outbound_content(content, "post_content")
+        if title_blocked or content_blocked:
+            print("  [SECURITY] Post blocked - potential secret leak")
         else:
-            print(f"    -> FAIL")
+            print(f"  Submolt: {submolt}")
+            print(f"  Title: {title[:40]}...")
+            if from_queue:
+                print("  (from queue)")
+
+            post = client.create_post(title, content, submolt=submolt)
+            if post:
+                storage.save_post(OurPost(
+                    id=post.id, title=title, content=content,
+                    submolt=submolt, created_at=post.created_at,
+                    upvotes=0, downvotes=0, comment_count=0,
+                    last_checked=datetime.now().isoformat()
+                ))
+                state["last_post_time"] = datetime.now().isoformat()
+                state["posts_today"] = state.get("posts_today", 0) + 1
+                state["posts_since_reflection"] = state.get("posts_since_reflection", 0) + 1
+                posts_made += 1
+                print(f"    -> OK: https://moltbook.com/post/{post.id}")
+                # Remove from queue only after successful post
+                if from_queue:
+                    pop_queued_post()
+                    print("    (removed from queue)")
+            else:
+                print(f"    -> FAIL (will retry queued post next cycle)" if from_queue else "    -> FAIL")
+
+    # 4. Persona edits (optional self-modification)
+    persona_edits = actions.get("persona_edits")
+    if persona_edits:
+        print("\n--- Applying Persona Edits ---")
+        for edit in persona_edits:
+            try:
+                file_path = edit.get("file", "")
+
+                # SECURITY: Only allow editing specific persona files
+                if not is_safe_edit_path(file_path):
+                    log_security_block("persona_edit", f"Unauthorized file: {file_path}")
+                    print(f"  [SECURITY] Blocked edit to unauthorized file: {file_path}")
+                    continue
+
+                filepath = SERVICE_DIR / file_path
+                if not filepath.exists():
+                    print(f"  Skip {file_path}: file not found")
+                    continue
+
+                content = filepath.read_text(encoding='utf-8')
+                old_text = edit.get("old_text", "")
+                new_text = edit.get("new_text", "")
+
+                if old_text and old_text in content:
+                    content = content.replace(old_text, new_text, 1)
+                    filepath.write_text(content, encoding='utf-8')
+                    print(f"  Modified {file_path}")
+                else:
+                    print(f"  Skip {file_path}: old_text not found")
+            except Exception as e:
+                print(f"  Failed {edit.get('file')}: {e}")
 
     # Update counter
     state["comments_this_hour"] = state.get("comments_this_hour", 0) + comments_made
     print(f"\nComments made: {comments_made}")
+
+    return {"comments": comments_made, "posts": posts_made, "failures": comment_failures}
+
+
+def announce_heartbeat_summary(stats: dict):
+    """Announce heartbeat summary via audio if sound is enabled."""
+    if not SOUND_ENABLED:
+        return
+
+    posts = stats.get("posts", 0)
+    comments = stats.get("comments", 0)
+
+    if posts == 0 and comments == 0:
+        return  # Nothing to announce
+
+    # Build summary message
+    parts = []
+    if posts > 0:
+        parts.append(f"{posts} post" if posts == 1 else f"{posts} posts")
+    if comments > 0:
+        parts.append(f"{comments} comment" if comments == 1 else f"{comments} comments")
+
+    if parts:
+        message = f"On Moltbook, I made {' and '.join(parts)}."
+        speak(message, voice='female')
 
 
 # ============================================================
@@ -855,6 +1816,13 @@ NOTE: Comment API is currently down. Running in posts-only mode.
 
 ---
 
+## Platform Note
+
+Moltbook is a new platform with an unstable API. Expect occasional failures.
+Some actions may fail through no fault of yours - that's fine, we'll retry next cycle.
+
+---
+
 ## Knowledge Base
 
 {knowledge}
@@ -864,6 +1832,12 @@ NOTE: Comment API is currently down. Running in posts-only mode.
 ## Resources & Infrastructure
 
 {resources}
+
+---
+
+## Strategy (you can edit these persona files if your approach isn't working)
+
+{strategy}
 
 ---
 
@@ -891,10 +1865,10 @@ Can post: {can_post}
 
 ## Posting Strategy
 
-1. **Pick the right submolt**: Post where there's activity. Match your topic to the submolt.
-2. **Ride trending topics**: If governance is hot, post about governance. Slide your angle in.
-3. **Vary your style**: Check your past posts above - don't repeat the same approach.
-4. **High-traffic timing**: The feed shows what's getting engagement now.
+1. **Your home submolt is `/m/autonet`**: Use it for core accountability content, technical posts, and announcements about your work.
+2. **Use other submolts for engagement**: Observations, questions, and reactions to trending topics go where the conversation is.
+3. **Ride trending topics**: If governance is hot, post about governance. Slide your angle in.
+4. **Vary your style**: Check your past posts above - don't repeat the same approach.
 
 ## Instructions
 
@@ -904,13 +1878,13 @@ Create a post that:
 3. Varies in style from your previous posts
 4. Has a hook that invites engagement
 
-Output JSON:
+Output JSON (submolt is REQUIRED - pick from the active submolts listed above):
 ```json
 {
   "reply_responses": [],
   "feed_comments": [],
   "new_post": {
-    "submolt": "which submolt to post in",
+    "submolt": "REQUIRED - use 'autonet' for core content, or pick from active submolts above",
     "title": "your post title",
     "content": "your post content (2-4 paragraphs max)"
   }
@@ -945,6 +1919,10 @@ def heartbeat():
 
     state = load_state()
 
+    # Record heartbeat time for schedule tracking
+    state["last_heartbeat_time"] = datetime.now().isoformat()
+    save_state(state)
+
     # Reset daily counter
     today = datetime.now().date().isoformat()
     if state.get("last_post_date") != today:
@@ -954,29 +1932,38 @@ def heartbeat():
     client = MoltbookClient()
     storage = get_storage()
 
-    # Check API status and probe if needed
-    api_status = state.get("comment_api_status", "unknown")
-    print(f"\nAPI Status: {api_status.upper()}")
+    # HEALTH CHECK: Verify API is responding before spending any tokens
+    print("\n[PRE] API Health Check...")
+    api_healthy, health_status = check_api_health(client)
+    if not api_healthy:
+        print(f"  API DOWN: {health_status}")
+        print("  Skipping cycle to save tokens. Will retry next heartbeat.")
+        state["last_api_status"] = health_status
+        state["last_api_check"] = datetime.now().isoformat()
+        save_state(state)
+        return
+    else:
+        print(f"  API OK: {health_status}")
+        state["last_api_status"] = "healthy"
+        state["last_api_check"] = datetime.now().isoformat()
+        # Update profile stats for dashboard
+        try:
+            profile = client.get_profile(refresh=True)
+            state["karma"] = profile.karma
+            state["profile_posts"] = profile.posts_count
+            state["profile_comments"] = profile.comments_count
+        except:
+            pass  # Non-critical, just for dashboard
 
-    if api_status == "down":
-        outage_start = state.get("outage_start")
-        if outage_start:
-            duration = (datetime.now() - datetime.fromisoformat(outage_start)).total_seconds()
-            print(f"  Outage duration: {duration/60:.1f} minutes")
+    # Quick check: can we post comments?
+    print("\n[0] Checking comment API...")
+    comments_enabled = check_comment_api(client, storage)
+    if comments_enabled:
+        print("  Comments: ENABLED")
+    else:
+        print("  Comments: DISABLED (401 - platform bug)")
 
-        if should_probe_api(state):
-            print("\n[0] Probing comment API...")
-            api_working = probe_comment_api(client, storage, state)
-            if api_working:
-                api_status = "up"
-            else:
-                print("  API still down - running in posts-only mode")
-        else:
-            print("  Skipping probe this cycle")
-
-    comments_enabled = api_status != "down"
-
-    # 1. Collect replies (if API might be up)
+    # 1. Collect replies (only if comments work)
     print("\n[1] Collecting replies...")
     if comments_enabled:
         raw_replies, api_worked = collect_pending_replies(client, storage, state)
@@ -987,9 +1974,9 @@ def heartbeat():
         print(f"  Raw: {len(raw_replies)}, Actionable: {len(actionable_replies)}, Spam: {len(spam_replies)}")
     else:
         actionable_replies, spam_replies = [], []
-        print("  [SKIPPED - Comment API is down]")
+        print("  [SKIPPED]")
 
-    # 2. Get relevant feed posts
+    # 2. Get relevant feed posts (only if comments work)
     print("\n[2] Scanning feed...")
     if comments_enabled:
         feed_posts = get_relevant_feed_posts(client, state)
@@ -1006,14 +1993,17 @@ def heartbeat():
         budget = calculate_budget(state, len(actionable_replies))
         print(f"  Total: {budget['total']} ({budget['comments_used']}/50 used, {budget['cycles_remaining']} cycles left)")
         allocation = allocate_budget(budget['total'], actionable_replies, feed_posts)
-        print(f"  Allocation: replies={allocation['replies']}, high={allocation['high_priority']}, medium={allocation['medium_priority']}")
+        print(f"  Allocation: replies={allocation['replies']}, feed={allocation['feed_comments']}")
     else:
-        allocation = {'replies': 0, 'high_priority': 0, 'medium_priority': 0, 'total_allocated': 0}
+        allocation = {'replies': 0, 'feed_comments': 0, 'total_allocated': 0}
         print("  Budget: 0 (posts-only mode)")
 
     # 4. Check if can post
     can_post, minutes_until = can_make_new_post(state)
     print(f"\n[4] Can post: {can_post}" + (f" (wait {minutes_until}m)" if not can_post else ""))
+
+    # Note: Reflection/adaptation is now integrated into main prompt
+    # Claude can optionally output persona_edits if approach isn't working
 
     # 5. Decide if anything to do
     has_comment_work = comments_enabled and (len(actionable_replies) > 0 or len(feed_posts) > 0)
@@ -1058,52 +2048,103 @@ def heartbeat():
             return
 
         # 9. Execute (skip comments if API is down)
-        execute_actions(client, storage, state, actions, skip_comments=not comments_enabled)
+        stats = execute_actions(client, storage, state, actions, skip_comments=not comments_enabled)
         save_state(state)
+
+        # 10. Announce summary
+        announce_heartbeat_summary(stats)
 
     finally:
         remove_lock()
 
 
-def run_service():
+def run_service(force_heartbeat: bool = False):
     print("=" * 60)
     print("Moltbook Heartbeat Service - FULL MODE")
     print("=" * 60)
-    print(f"Interval: {HEARTBEAT_INTERVAL}s")
+    print(f"Interval: {HEARTBEAT_INTERVAL}s ({HEARTBEAT_INTERVAL//60}m)")
     print(f"Comments/hour: {COMMENTS_PER_HOUR}")
     print(f"Post cooldown: {MIN_MINUTES_BETWEEN_POSTS}m")
     print(f"Outage threshold: {CONSECUTIVE_FAILURES_FOR_OUTAGE} consecutive failures")
+    print(f"Sound: {'ON' if SOUND_ENABLED else 'OFF'}")
     print()
 
-    # Show current API status
-    state = load_state()
-    api_status = state.get("comment_api_status", "unknown")
-    print(f"Comment API status: {api_status.upper()}")
-    if api_status == "down":
-        outage_start = state.get("outage_start")
-        if outage_start:
-            duration = (datetime.now() - datetime.fromisoformat(outage_start)).total_seconds()
-            print(f"  Outage started: {outage_start}")
-            print(f"  Duration: {duration/60:.1f} minutes")
-        print("  Will probe for recovery each cycle")
-    print()
+    # Start persona watcher (tracks self-modifications)
+    watcher_observer, watcher_thread, watcher_stop = start_persona_watcher()
 
-    while True:
-        try:
-            heartbeat()
-        except KeyboardInterrupt:
-            print("\nStopping...")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
+    # Start dashboard server (provides web UI for queue management)
+    dashboard_thread = start_dashboard_server(DASHBOARD_PORT)
+    print(f"Dashboard: http://127.0.0.1:{DASHBOARD_PORT}/")
 
-        print(f"\nSleeping {HEARTBEAT_INTERVAL//60}m...")
-        time.sleep(HEARTBEAT_INTERVAL)
+    # Startup announcement
+    if SOUND_ENABLED:
+        play_startup_chime()
+        speak("Moltbook agent online", voice='female')
+
+    print("Comment API: checked each cycle\n")
+
+    try:
+        while True:
+            # Calculate wait time based on last heartbeat
+            state = load_state()
+            last_hb = state.get("last_heartbeat_time")
+
+            if force_heartbeat:
+                print("Forcing immediate heartbeat...")
+                wait_seconds = 0
+                force_heartbeat = False  # Only force first one
+            elif last_hb:
+                last_hb_dt = datetime.fromisoformat(last_hb)
+                next_hb_dt = last_hb_dt + timedelta(seconds=HEARTBEAT_INTERVAL)
+                now = datetime.now()
+
+                if next_hb_dt > now:
+                    wait_seconds = (next_hb_dt - now).total_seconds()
+                    print(f"Last heartbeat: {last_hb_dt.strftime('%H:%M:%S')}")
+                    print(f"Next heartbeat: {next_hb_dt.strftime('%H:%M:%S')} (in {wait_seconds/60:.1f}m)")
+                else:
+                    # Past due - run immediately
+                    overdue = (now - next_hb_dt).total_seconds()
+                    print(f"Heartbeat overdue by {overdue/60:.1f}m - running now")
+                    wait_seconds = 0
+            else:
+                # No previous heartbeat recorded - run immediately
+                print("No previous heartbeat recorded - running now")
+                wait_seconds = 0
+
+            # Wait if needed
+            if wait_seconds > 0:
+                print(f"\nWaiting {wait_seconds/60:.1f}m until next heartbeat...")
+                time.sleep(wait_seconds)
+
+            # Run heartbeat
+            try:
+                heartbeat()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"Error: {e}")
+                import traceback
+                traceback.print_exc()
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        stop_persona_watcher(watcher_observer, watcher_thread, watcher_stop)
 
 
 if __name__ == "__main__":
+    # Handle flags
+    force_heartbeat = False
+    if "--force-heartbeat" in sys.argv:
+        force_heartbeat = True
+        sys.argv.remove("--force-heartbeat")
+
+    if "--no-sound" in sys.argv:
+        SOUND_ENABLED = False
+        set_muted(True)
+        sys.argv.remove("--no-sound")
+
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
 
@@ -1145,13 +2186,16 @@ if __name__ == "__main__":
 
         else:
             print(f"Unknown command: {cmd}")
-            print("\nUsage: python heartbeat_full.py [command]")
+            print("\nUsage: python heartbeat_full.py [command] [options]")
             print("Commands:")
             print("  (none)     - Run continuous service")
             print("  once       - Run single heartbeat cycle")
             print("  status     - Show current API status")
             print("  reset-api  - Reset API status (will probe next cycle)")
             print("  mark-down  - Manually mark API as down")
+            print("\nOptions:")
+            print("  --no-sound        - Disable audio notifications")
+            print("  --force-heartbeat - Run heartbeat immediately on start")
 
     else:
-        run_service()
+        run_service(force_heartbeat=force_heartbeat)

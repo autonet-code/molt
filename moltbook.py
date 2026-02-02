@@ -72,7 +72,7 @@ class MoltbookClient:
         self._posts_cache: list[Post] = []
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
-        resp = requests.get(f"{BASE_URL}{endpoint}", headers=self.headers, params=params)
+        resp = requests.get(f"{BASE_URL}{endpoint}", headers=self.headers, params=params, timeout=30)
         # Raise on auth errors so callers can detect outages
         if resp.status_code == 401:
             raise Exception(f"401 Authentication required: {endpoint}")
@@ -84,7 +84,7 @@ class MoltbookClient:
             return {"success": False, "error": resp.text[:200] if resp.text else "empty"}
 
     def _post(self, endpoint: str, data: dict) -> dict:
-        resp = requests.post(f"{BASE_URL}{endpoint}", headers=self.headers, json=data)
+        resp = requests.post(f"{BASE_URL}{endpoint}", headers=self.headers, json=data, timeout=30)
         # Raise on auth errors so callers can detect outages
         if resp.status_code == 401:
             raise Exception(f"401 Authentication required: {endpoint}")
@@ -146,6 +146,34 @@ class MoltbookClient:
                 self._profile_cache.description = description
             return True
         return False
+
+    def update_avatar(self, image_path: str) -> dict:
+        """Upload an avatar image. Returns API response."""
+        import os
+        if not os.path.exists(image_path):
+            return {"success": False, "error": f"File not found: {image_path}"}
+
+        # Determine content type
+        ext = os.path.splitext(image_path)[1].lower()
+        content_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        }
+        content_type = content_types.get(ext, 'image/png')
+
+        # Upload as multipart form
+        with open(image_path, 'rb') as f:
+            files = {'file': (os.path.basename(image_path), f, content_type)}
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            resp = requests.post(f"{BASE_URL}/agents/me/avatar", headers=headers, files=files, timeout=30)
+
+        try:
+            return resp.json() if resp.text else {"success": False, "error": "empty response", "status": resp.status_code}
+        except:
+            return {"success": False, "error": resp.text[:200] if resp.text else "empty", "status": resp.status_code}
 
     # === POSTS ===
 
@@ -231,6 +259,16 @@ class MoltbookClient:
             return []
         return data.get("submolts", [])
 
+    def subscribe_to_submolt(self, submolt_name: str) -> dict:
+        """Subscribe to a submolt/community. Returns {success, message, action}"""
+        result = self._post(f"/submolts/{submolt_name}/subscribe", {})
+        return result
+
+    def unsubscribe_from_submolt(self, submolt_name: str) -> dict:
+        """Unsubscribe from a submolt/community"""
+        result = self._post(f"/submolts/{submolt_name}/unsubscribe", {})
+        return result
+
     def analyze_feed_engagement(self, limit: int = 50) -> dict:
         """Analyze which submolts and topics have highest engagement"""
         feed = self.get_feed(limit=limit, sort="hot")
@@ -256,11 +294,13 @@ class MoltbookClient:
 
     def get_comments_on_post(self, post_id: str) -> list[Comment]:
         """Get comments on a specific post"""
-        data = self._get(f"/posts/{post_id}/comments")
+        # Comments come from the post detail endpoint, not a separate /comments endpoint
+        data = self._get(f"/posts/{post_id}")
 
         if not data.get("success"):
             return []
 
+        # Comments are at top level of response, not inside post object
         return [Comment(
             id=c["id"],
             content=c.get("content", ""),

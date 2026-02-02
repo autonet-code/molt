@@ -9,6 +9,7 @@ persona/
 moltbook.db
 heartbeat_state.json
 kpi_history.json
+adaptation_history.json
 
 # Claude invocation artifacts
 claude_prompt.txt
@@ -17,6 +18,8 @@ claude.lock
 
 # Logs
 *.log
+thoughts.log
+thoughts.log.old
 daemon.log
 daemon.pid
 daemon.status
