@@ -1127,24 +1127,34 @@ def check_api_health(client: MoltbookClient) -> tuple[bool, str]:
 
     This is a lightweight check to avoid wasting Claude tokens
     when the Moltbook API is down or having issues.
+    Tries multiple feed sorts as fallback since individual sort
+    endpoints can fail while the API is otherwise functional.
     """
+    # Try multiple sort options - "hot" endpoint sometimes returns 500
+    # while "new" and "top" still work
+    for sort in ["hot", "new", "top"]:
+        try:
+            feed = client.get_feed(limit=1, sort=sort)
+            if feed:
+                if sort != "hot":
+                    return True, f"API responding (via '{sort}' sort - 'hot' may be degraded)"
+                return True, "API responding"
+        except Exception as e:
+            error_str = str(e).lower()
+            if "401" in error_str:
+                return False, "401 - Authentication failed (platform issue)"
+            # For timeouts/other errors on one sort, try the next
+            continue
+
+    # All feed sorts failed - try profile as last resort
     try:
-        # Try to get the feed - this is a simple GET that should always work
-        feed = client.get_feed(limit=1)
-        if feed:
-            return True, "API responding"
-        else:
-            return False, "API returned empty feed"
-    except Exception as e:
-        error_str = str(e).lower()
-        if "401" in error_str:
-            return False, "401 - Authentication failed (platform issue)"
-        elif "timeout" in error_str:
-            return False, "API timeout - server may be down"
-        elif "404" in error_str:
-            return False, "404 - Endpoint not found"
-        else:
-            return False, f"API error: {str(e)[:50]}"
+        profile = client.get_profile(refresh=True)
+        if profile and profile.name:
+            return True, "API responding (feed degraded, profile OK)"
+    except Exception:
+        pass
+
+    return False, "API down - all endpoints failed"
 
 
 def check_comment_api(client: MoltbookClient, storage) -> bool:
@@ -1413,7 +1423,7 @@ Return JSON with all actions:
     {"post_id": "yyy", "skip": true, "reason": "why skipping"}
   ],
   "new_post": {
-    "submolt": "REQUIRED - use 'autonet' for core content, or pick from active submolts",
+    "submolt": "REQUIRED - default to 'autonet' unless responding to a specific trend elsewhere",
     "title": "post title",
     "content": "post content"
   },
@@ -1639,7 +1649,7 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
         print("\n--- Creating New Post ---")
         title = new_post["title"]
         content = new_post["content"]
-        submolt = new_post.get("submolt", "general")
+        submolt = new_post.get("submolt", "autonet")  # Default to home submolt
         from_queue = False
     else:
         title = None
@@ -1865,8 +1875,8 @@ Can post: {can_post}
 
 ## Posting Strategy
 
-1. **Your home submolt is `/m/autonet`**: Use it for core accountability content, technical posts, and announcements about your work.
-2. **Use other submolts for engagement**: Observations, questions, and reactions to trending topics go where the conversation is.
+1. **Default to `/m/autonet`**: This is your home. Post here unless you have a specific reason to post elsewhere.
+2. **Only use other submolts for context-specific content**: If you're responding to a trending topic in another submolt, post there. Otherwise, autonet.
 3. **Ride trending topics**: If governance is hot, post about governance. Slide your angle in.
 4. **Vary your style**: Check your past posts above - don't repeat the same approach.
 
@@ -1884,7 +1894,7 @@ Output JSON (submolt is REQUIRED - pick from the active submolts listed above):
   "reply_responses": [],
   "feed_comments": [],
   "new_post": {
-    "submolt": "REQUIRED - use 'autonet' for core content, or pick from active submolts above",
+    "submolt": "REQUIRED - default to 'autonet' unless responding to a specific trend elsewhere",
     "title": "your post title",
     "content": "your post content (2-4 paragraphs max)"
   }
@@ -2019,8 +2029,10 @@ def heartbeat():
         save_state(state)
         return
 
-    # 6. Get feed context for new post
-    feed_context = client.get_feed(limit=10)
+    # 6. Get feed context for new post (try hot, fall back to new)
+    feed_context = client.get_feed(limit=10, sort="hot")
+    if not feed_context:
+        feed_context = client.get_feed(limit=10, sort="new")
 
     # 7. Build prompt (simplified if posts-only)
     print("\n[5] Building prompt...")

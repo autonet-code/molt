@@ -240,17 +240,25 @@ class MoltbookClient:
         if not data.get("success"):
             return []
 
-        return [Post(
-            id=p["id"],
-            title=p["title"],
-            content=p.get("content", ""),
-            upvotes=p.get("upvotes", 0),
-            downvotes=p.get("downvotes", 0),
-            comment_count=p.get("comment_count", 0),
-            created_at=p["created_at"],
-            author_name=p.get("author", {}).get("name", ""),
-            submolt=p.get("submolt", {}).get("name", "")
-        ) for p in data.get("posts", [])]
+        posts = []
+        for p in data.get("posts", []):
+            try:
+                author_obj = p.get("author") or {}
+                submolt_obj = p.get("submolt") or {}
+                posts.append(Post(
+                    id=p["id"],
+                    title=p.get("title", ""),
+                    content=p.get("content", ""),
+                    upvotes=p.get("upvotes", 0),
+                    downvotes=p.get("downvotes", 0),
+                    comment_count=p.get("comment_count", 0),
+                    created_at=p.get("created_at", ""),
+                    author_name=author_obj.get("name", "") if isinstance(author_obj, dict) else "",
+                    submolt=submolt_obj.get("name", "") if isinstance(submolt_obj, dict) else str(submolt_obj)
+                ))
+            except (KeyError, TypeError):
+                continue  # Skip malformed posts
+        return posts
 
     def get_submolts(self) -> list[dict]:
         """Get list of available submolts"""
