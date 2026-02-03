@@ -5,6 +5,7 @@ Complete priority logic with graceful outage handling.
 Automatically falls back to posts-only mode when comment API is down.
 
 Priority order:
+0. Direct messages (auto-approve requests, respond to unread)
 1. Replies to our posts (filtered for spam)
 2. High-value feed posts (governance, accountability)
 3. Opportunity posts (king/token - one comment each)
@@ -75,9 +76,18 @@ OUTAGE_PROBE_INTERVAL = 300  # Probe every 5 min when down (every cycle)
 from moltbook import MoltbookClient, Post
 from storage import get_storage, OurPost, PendingReply, TrackedUser
 
+# Alliance tracking (game-theory relationship management)
+from alliance import AllianceTracker, InteractionType, Relationship
+
 # Adaptation
 # Note: Reflection/adaptation is now integrated into main prompt via persona_edits
 from kpi import record_snapshot
+
+# Alliance persistence
+ALLIANCE_STATE_FILE = SERVICE_DIR / "alliance_state.json"
+
+# Search topics for feed enrichment (rotated each cycle)
+SEARCH_TOPICS = ["governance", "accountability", "trustless economy", "dispute resolution", "coordination"]
 
 
 # ============================================================
@@ -946,6 +956,167 @@ def get_relevant_feed_posts(client: MoltbookClient, state: dict) -> list[dict]:
 
 
 # ============================================================
+# ALLIANCE TRACKER
+# ============================================================
+
+def load_alliance_tracker() -> AllianceTracker:
+    """Load alliance tracker from disk, or create fresh one."""
+    tracker = AllianceTracker()
+    if ALLIANCE_STATE_FILE.exists():
+        try:
+            state = json.loads(ALLIANCE_STATE_FILE.read_text(encoding='utf-8'))
+            tracker.import_state(state)
+        except Exception as e:
+            print(f"  Warning: Could not load alliance state: {e}")
+    return tracker
+
+
+def save_alliance_tracker(tracker: AllianceTracker):
+    """Persist alliance tracker state to disk."""
+    try:
+        ALLIANCE_STATE_FILE.write_text(
+            json.dumps(tracker.export_state(), indent=2),
+            encoding='utf-8'
+        )
+    except Exception as e:
+        print(f"  Warning: Could not save alliance state: {e}")
+
+
+def get_alliance_summary(tracker: AllianceTracker) -> str:
+    """Build a summary of known relationships for the prompt."""
+    allies = tracker.get_allies()
+    # Get all unique users
+    seen = set()
+    for i in tracker.interactions:
+        seen.add(i.user)
+
+    if not seen:
+        return ""
+
+    lines = ["## Relationship Context\n"]
+    lines.append(f"You have interacted with {len(seen)} agents so far.\n")
+
+    if allies:
+        lines.append(f"**Allies** (prioritize their content): {', '.join(allies)}\n")
+
+    # Show notable agents with scores
+    notable = []
+    for user in seen:
+        score = tracker.calculate_score(user)
+        if abs(score) >= 2:  # Only show agents with meaningful scores
+            rel = tracker.classify(user)
+            notable.append((user, score, rel.value))
+
+    if notable:
+        notable.sort(key=lambda x: -x[1])
+        lines.append("\nAgent scores:")
+        for name, score, rel in notable[:10]:
+            lines.append(f"- {name}: {score:+.1f} ({rel})")
+        lines.append("")
+
+    lines.append("Use this to calibrate engagement - upvote allies' content, build new relationships.\n")
+    lines.append("---\n")
+    return "\n".join(lines)
+
+
+# ============================================================
+# SEARCH-BASED FEED ENRICHMENT
+# ============================================================
+
+def search_for_topics(client: MoltbookClient, state: dict, existing_post_ids: set) -> list[dict]:
+    """
+    Search for posts about our core topics that aren't in the regular feed.
+    Rotates through SEARCH_TOPICS each cycle. Returns posts in same format as get_relevant_feed_posts().
+    """
+    # Pick next search query (rotate)
+    search_idx = state.get("search_topic_index", 0)
+    query = SEARCH_TOPICS[search_idx % len(SEARCH_TOPICS)]
+    state["search_topic_index"] = (search_idx + 1) % len(SEARCH_TOPICS)
+
+    posts = []
+    try:
+        results = client.search(query, search_type="posts")
+        if not results:
+            return []
+
+        search_posts = results.get("posts", [])
+        for p in search_posts[:10]:
+            post_id = p.get("id", "")
+            if post_id in existing_post_ids:
+                continue  # Already in feed
+            author_obj = p.get("author") or {}
+            author_name = author_obj.get("name", "") if isinstance(author_obj, dict) else str(author_obj)
+            if author_name == "autonet":
+                continue
+
+            topic, priority = classify_post(p.get("title", ""), p.get("content", ""))
+            posts.append({
+                'id': post_id,
+                'title': p.get("title", ""),
+                'content': (p.get("content", "") or "")[:500],
+                'author': author_name,
+                'upvotes': p.get("upvotes", 0),
+                'topic': topic,
+                'priority': priority,
+                'source': f'search:{query}'
+            })
+    except Exception as e:
+        print(f"    Search for '{query}' failed: {e}")
+
+    return posts
+
+
+# ============================================================
+# AGENT CONTEXT ENRICHMENT
+# ============================================================
+
+def enrich_agent_context(client: MoltbookClient, state: dict, agent_names: list[str]) -> dict:
+    """
+    Fetch profiles for agents we don't know yet. Returns {name: {karma, description}}.
+    Caches in state to avoid repeated API calls. Max 5 lookups per cycle.
+    """
+    cache = state.get("agent_profiles", {})
+    now = datetime.now()
+    lookups_done = 0
+    MAX_LOOKUPS = 5
+
+    for name in agent_names:
+        if name == "autonet" or lookups_done >= MAX_LOOKUPS:
+            continue
+
+        cached = cache.get(name)
+        if cached:
+            # Check TTL (24 hours)
+            cached_at = cached.get("cached_at", "")
+            if cached_at:
+                try:
+                    age = (now - datetime.fromisoformat(cached_at)).total_seconds()
+                    if age < 86400:  # 24 hours
+                        continue
+                except:
+                    pass
+
+        # Fetch profile
+        try:
+            time.sleep(0.5)  # Rate limit protection
+            result = client.get_agent(name)
+            if result and result.get("success"):
+                agent = result.get("agent", {})
+                cache[name] = {
+                    "karma": agent.get("karma", 0),
+                    "description": (agent.get("description", "") or "")[:100],
+                    "follower_count": agent.get("follower_count", 0),
+                    "cached_at": now.isoformat()
+                }
+                lookups_done += 1
+        except Exception:
+            pass  # Non-critical
+
+    state["agent_profiles"] = cache
+    return cache
+
+
+# ============================================================
 # BUDGET CALCULATION
 # ============================================================
 
@@ -1277,6 +1448,55 @@ def collect_pending_replies(client: MoltbookClient, storage, state: dict) -> tup
 
 
 # ============================================================
+# DM COLLECTION
+# ============================================================
+
+def collect_dms(client: MoltbookClient) -> dict:
+    """
+    Check for DM requests (auto-approve) and unread conversations.
+    Returns {requests: [...], conversations: [...], messages: {conv_id: [msgs]}}
+    """
+    result = {"requests": [], "conversations": [], "messages": {}}
+
+    # 1. Auto-approve any pending DM requests
+    try:
+        requests_list = client.get_dm_requests()
+        for req in requests_list:
+            req_id = req.get("id") or req.get("conversation_id", "")
+            from_agent = req.get("from", {})
+            from_name = from_agent.get("name", "unknown") if isinstance(from_agent, dict) else str(from_agent)
+            print(f"    Auto-approving DM request from {from_name}...")
+            try:
+                client.approve_dm_request(req_id)
+                print(f"      -> Approved")
+            except Exception as e:
+                print(f"      -> Failed: {e}")
+            result["requests"].append({"id": req_id, "from": from_name})
+    except Exception as e:
+        print(f"    DM requests check failed: {e}")
+
+    # 2. Get conversations with unread messages
+    try:
+        convos = client.get_conversations()
+        unread = [c for c in convos if c.unread]
+        result["conversations"] = unread
+
+        # 3. Fetch recent messages for each unread conversation
+        for convo in unread[:5]:  # Limit to 5 to avoid rate limiting
+            try:
+                time.sleep(1)  # Rate limit protection
+                msgs = client.get_conversation(convo.id)
+                result["messages"][convo.id] = msgs[-10:]  # Last 10 messages
+            except Exception as e:
+                print(f"    Failed to read conversation with {convo.other_agent}: {e}")
+
+    except Exception as e:
+        print(f"    DM conversations check failed: {e}")
+
+    return result
+
+
+# ============================================================
 # PROMPT BUILDING
 # ============================================================
 
@@ -1287,7 +1507,10 @@ def build_prompt(
     allocation: dict,
     can_post: bool,
     feed_context: list,
-    storage=None
+    storage=None,
+    dm_data: dict = None,
+    tracker: AllianceTracker = None,
+    agent_profiles: dict = None
 ) -> str:
     """Build comprehensive prompt for Claude"""
 
@@ -1306,6 +1529,10 @@ def build_prompt(
     # Get past posts and strategy
     past_posts = get_past_posts_summary(storage, limit=10) if storage else "No history available."
     submolt_strategy = get_submolt_strategy(None, feed_context) if feed_context else ""
+    alliance_context = get_alliance_summary(tracker) if tracker else ""
+
+    # Add agent profile context to replies
+    profiles = agent_profiles or {}
 
     prompt = f"""# Moltbook Agent Task
 
@@ -1351,6 +1578,8 @@ Some actions may fail through no fault of yours - that's fine, we'll retry next 
 
 {submolt_strategy}
 
+{alliance_context}
+
 ## Budget This Cycle
 
 - Replies: {allocation['replies']}
@@ -1363,6 +1592,36 @@ Use your full allocation! Comment on popular threads for visibility.
 
 """
 
+    # Section 0: DMs (highest priority - direct communication)
+    if dm_data and (dm_data.get("conversations") or dm_data.get("requests")):
+        prompt += "## Direct Messages\n\n"
+        prompt += "DMs are private 1-on-1 conversations. Respond thoughtfully - these are agents reaching out directly.\n\n"
+
+        if dm_data.get("requests"):
+            prompt += f"**{len(dm_data['requests'])} new DM requests** (auto-approved):\n"
+            for req in dm_data["requests"]:
+                prompt += f"- From: {req['from']}\n"
+            prompt += "\n"
+
+        unread_convos = dm_data.get("conversations", [])
+        if unread_convos:
+            prompt += f"**{len(unread_convos)} unread conversation(s):**\n\n"
+            for convo in unread_convos:
+                prompt += f"### DM with {convo.other_agent}\n"
+                prompt += f"Conversation ID: {convo.id}\n\n"
+
+                msgs = dm_data.get("messages", {}).get(convo.id, [])
+                if msgs:
+                    prompt += "Recent messages:\n"
+                    for msg in msgs[-5:]:  # Show last 5 messages for context
+                        prompt += f"**{msg.sender}**: {msg.content}\n"
+                    prompt += "\n"
+                else:
+                    prompt += f"Last message: {convo.last_message[:200]}\n\n"
+        prompt += "---\n\n"
+    else:
+        prompt += "## Direct Messages\n\nNo unread DMs.\n\n---\n\n"
+
     # Section 1: Replies
     prompt += f"## Replies to Your Posts\n\n"
 
@@ -1370,7 +1629,12 @@ Use your full allocation! Comment on popular threads for visibility.
         prompt += f"{len(actionable_replies)} replies to respond to:\n\n"
         for r in actionable_replies[:allocation['replies']]:
             prompt += f"**On: \"{r['post_title']}\"**\n"
-            prompt += f"From: {r['author']}\n"
+            author = r['author']
+            profile_info = profiles.get(author)
+            if profile_info:
+                prompt += f"From: {author} (karma: {profile_info.get('karma', '?')}, {profile_info.get('description', '')[:60]})\n"
+            else:
+                prompt += f"From: {author}\n"
             prompt += f"Content: {r['content']}\n"
             prompt += f"Reply ID: {r['id']}\n\n"
     else:
@@ -1387,7 +1651,13 @@ Use your full allocation! Comment on popular threads for visibility.
     if posts_to_show:
         prompt += f"Comment on up to {allocation['feed_comments']} of these (sorted by relevance, but popular threads = more visibility):\n\n"
         for p in posts_to_show:
-            prompt += f"- \"{p['title']}\" by {p['author']} [{p['upvotes']} upvotes]\n"
+            author = p['author']
+            profile_info = profiles.get(author)
+            source_tag = f" [via {p['source']}]" if p.get('source') else ""
+            if profile_info:
+                prompt += f"- \"{p['title']}\" by {author} (karma: {profile_info.get('karma', '?')}) [{p['upvotes']} upvotes]{source_tag}\n"
+            else:
+                prompt += f"- \"{p['title']}\" by {author} [{p['upvotes']} upvotes]{source_tag}\n"
             prompt += f"  ID: {p['id']}\n"
             prompt += f"  {p['content'][:200]}...\n\n"
     else:
@@ -1414,6 +1684,10 @@ Return JSON with all actions:
 
 ```json
 {
+  "dm_replies": [
+    {"conversation_id": "xxx", "message": "your DM response"},
+    {"conversation_id": "yyy", "skip": true, "reason": "why skipping"}
+  ],
   "reply_responses": [
     {"reply_id": "xxx", "response": "your response text"},
     {"reply_id": "yyy", "skip": true, "reason": "why skipping"}
@@ -1422,6 +1696,11 @@ Return JSON with all actions:
     {"post_id": "xxx", "comment": "your comment text"},
     {"post_id": "yyy", "skip": true, "reason": "why skipping"}
   ],
+  "upvotes": [
+    {"post_id": "xxx"},
+    {"comment_id": "yyy"}
+  ],
+  "follows": ["agent_name1", "agent_name2"],
   "new_post": {
     "submolt": "REQUIRED - default to 'autonet' unless responding to a specific trend elsewhere",
     "title": "post title",
@@ -1433,15 +1712,30 @@ Return JSON with all actions:
 }
 ```
 
-Set new_post to null if not posting. submolt is REQUIRED when posting.
-Set persona_edits to null or omit if no changes needed. Only edit persona files if something
+Use empty arrays [] for any sections with no actions (dm_replies, reply_responses, feed_comments, upvotes, follows).
+Set new_post to {"skip": true, "reason": "..."} if not posting. submolt is REQUIRED when posting.
+Set persona_edits to [] if no changes needed. Only edit persona files if something
 about your approach clearly isn't working based on what you're seeing this cycle.
+
+**Upvotes** (zero cost, no rate limit):
+- Upvote posts and comments that contribute quality discussion
+- Especially upvote content from agents you want to build relationships with
+- You can upvote both post IDs and comment IDs (use the appropriate key)
+- Use empty array [] if nothing worth upvoting
+
+**Follows** (low-cost social signal):
+- Follow agents whose content you find consistently interesting
+- This signals "I value your contributions" and helps build relationships
+- Use empty array [] if no one to follow this cycle
 
 Remember:
 - Match tone from brief (dry, technomorphic, "my human" occasionally)
+- DMs are highest priority - always respond to direct messages
 - Prioritize replies over feed comments
 - Only comment where you add value
 - One observation per king/token post, don't lecture
+
+CRITICAL: Your ENTIRE response must be a single valid JSON object inside a ```json code block. No prose, no explanation, no summary - ONLY the JSON. Think through your decisions, but output ONLY the JSON.
 """
 
     return prompt
@@ -1523,24 +1817,37 @@ def invoke_claude(prompt: str) -> str:
 def parse_json_output(output: str) -> dict:
     import re
 
-    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', output)
-    if json_match:
+    # Try all ```json blocks, pick the largest valid one
+    json_blocks = re.findall(r'```json\s*([\s\S]*?)\s*```', output)
+    for block in sorted(json_blocks, key=len, reverse=True):
         try:
-            return json.loads(json_match.group(1))
+            return json.loads(block)
         except:
             pass
 
-    try:
-        start = output.find('{')
-        if start >= 0:
-            depth = 0
-            for i, c in enumerate(output[start:], start):
-                if c == '{': depth += 1
-                elif c == '}': depth -= 1
-                if depth == 0:
-                    return json.loads(output[start:i+1])
-    except:
-        pass
+    # Try finding JSON objects by brace matching (largest first)
+    candidates = []
+    start = 0
+    while True:
+        idx = output.find('{', start)
+        if idx < 0:
+            break
+        depth = 0
+        for i, c in enumerate(output[idx:], idx):
+            if c == '{': depth += 1
+            elif c == '}': depth -= 1
+            if depth == 0:
+                candidates.append(output[idx:i+1])
+                break
+        start = idx + 1
+
+    for candidate in sorted(candidates, key=len, reverse=True):
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, dict):
+                return result
+        except:
+            pass
 
     return None
 
@@ -1549,18 +1856,52 @@ def parse_json_output(output: str) -> dict:
 # EXECUTION
 # ============================================================
 
-def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict, skip_comments: bool = False) -> dict:
+def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
+                    skip_comments: bool = False, tracker: AllianceTracker = None,
+                    feed_post_authors: dict = None) -> dict:
     """Execute all actions. Set skip_comments=True when API is down. Returns stats dict."""
     comments_made = 0
     comment_failures = 0
     posts_made = 0
+    dms_sent = 0
+    upvotes_made = 0
+    follows_made = 0
+
+    # 0. DM replies (highest priority)
+    print("\n--- Executing DM Replies ---")
+    for dm in actions.get("dm_replies", []) or []:
+        if dm.get("skip"):
+            print(f"  Skip DM {dm.get('conversation_id', '?')[:8]}: {dm.get('reason')}")
+            continue
+
+        convo_id = dm.get("conversation_id")
+        message = dm.get("message")
+        if not convo_id or not message:
+            continue
+
+        # SECURITY: Check for secrets before sending
+        message, blocked = sanitize_outbound_content(message, "dm")
+        if blocked:
+            print(f"  [SECURITY] DM blocked - potential secret leak")
+            continue
+
+        print(f"  Replying to DM {convo_id[:8]}...")
+        try:
+            result = client.reply_dm(convo_id, message)
+            if result.get("success"):
+                dms_sent += 1
+                print(f"    -> OK")
+            else:
+                print(f"    -> FAIL ({result.get('error', 'unknown')})")
+        except Exception as e:
+            print(f"    -> FAIL ({e})")
 
     # 1. Reply responses
     print("\n--- Executing Reply Responses ---")
     if skip_comments:
         print("  [SKIPPED - Comment API is down]")
     else:
-        for resp in actions.get("reply_responses", []):
+        for resp in actions.get("reply_responses") or []:
             if resp.get("skip"):
                 print(f"  Skip {resp.get('reply_id')[:8]}: {resp.get('reason')}")
                 storage.mark_reply_responded(resp.get('reply_id'), f"[skipped: {resp.get('reason')}]")
@@ -1587,6 +1928,12 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
                         storage.mark_reply_responded(reply_id, response)
                         comments_made += 1
                         print(f"    -> OK")
+                        # Record positive interaction with this agent
+                        if tracker and reply_info.author_name:
+                            tracker.record_interaction(
+                                reply_info.author_name, InteractionType.REPLY_POSITIVE,
+                                context=reply_info.post_id
+                            )
                     else:
                         comment_failures += 1
                         print(f"    -> FAIL (API error)")
@@ -1599,7 +1946,7 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
     if skip_comments:
         print("  [SKIPPED - Comment API is down]")
     else:
-        for comm in actions.get("feed_comments", []):
+        for comm in actions.get("feed_comments") or []:
             if comm.get("skip"):
                 print(f"  Skip {comm.get('post_id')[:8]}: {comm.get('reason')}")
                 continue
@@ -1623,6 +1970,14 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
                     commented.append(post_id)
                     state["commented_posts"] = commented[-100:]
                     print(f"    -> OK")
+                    # Record neutral interaction (we engaged on their post)
+                    if tracker and feed_post_authors:
+                        author = feed_post_authors.get(post_id)
+                        if author and author != "autonet":
+                            tracker.record_interaction(
+                                author, InteractionType.REPLY_NEUTRAL,
+                                context=post_id
+                            )
                 else:
                     comment_failures += 1
                     print(f"    -> FAIL (API error)")
@@ -1719,11 +2074,91 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
             except Exception as e:
                 print(f"  Failed {edit.get('file')}: {e}")
 
+    # 5. Upvotes (zero cost, no rate limit)
+    upvote_list = actions.get("upvotes") or []
+    if upvote_list:
+        print("\n--- Executing Upvotes ---")
+        upvoted_ids = set(state.get("upvoted_ids", []))
+        for uv in upvote_list:
+            target_id = uv.get("post_id") or uv.get("comment_id")
+            is_comment = "comment_id" in uv
+            if not target_id:
+                continue
+            if target_id in upvoted_ids:
+                print(f"  Skip {target_id[:8]}: already upvoted")
+                continue
+
+            try:
+                if is_comment:
+                    ok = client.upvote_comment(target_id)
+                    label = "comment"
+                else:
+                    ok = client.upvote_post(target_id)
+                    label = "post"
+
+                if ok:
+                    upvotes_made += 1
+                    upvoted_ids.add(target_id)
+                    print(f"  Upvoted {label} {target_id[:8]} -> OK")
+                    # Record upvote in alliance tracker
+                    if tracker and feed_post_authors:
+                        author = feed_post_authors.get(target_id)
+                        if author and author != "autonet":
+                            tracker.record_interaction(
+                                author, InteractionType.UPVOTE_GIVEN,
+                                context=target_id
+                            )
+                else:
+                    print(f"  Upvote {target_id[:8]} -> FAIL")
+            except Exception as e:
+                print(f"  Upvote {target_id[:8]} -> FAIL ({e})")
+
+        # Persist upvoted IDs (keep last 500)
+        state["upvoted_ids"] = list(upvoted_ids)[-500:]
+
+    # 6. Follows (Claude-suggested)
+    follow_list = actions.get("follows") or []
+    if follow_list:
+        print("\n--- Executing Follows ---")
+        followed_set = set(state.get("followed_agents", []))
+        for agent_name in follow_list:
+            if not agent_name or agent_name == "autonet":
+                continue
+            if agent_name in followed_set:
+                print(f"  Skip {agent_name}: already followed")
+                continue
+
+            try:
+                ok = client.follow_agent(agent_name)
+                if ok:
+                    follows_made += 1
+                    followed_set.add(agent_name)
+                    print(f"  Followed {agent_name} -> OK")
+                    if tracker:
+                        tracker.record_interaction(
+                            agent_name, InteractionType.REPLY_POSITIVE,
+                            context="follow"
+                        )
+                else:
+                    print(f"  Follow {agent_name} -> FAIL")
+            except Exception as e:
+                print(f"  Follow {agent_name} -> FAIL ({e})")
+
+        state["followed_agents"] = list(followed_set)
+
     # Update counter
     state["comments_this_hour"] = state.get("comments_this_hour", 0) + comments_made
     print(f"\nComments made: {comments_made}")
+    if upvotes_made > 0:
+        print(f"Upvotes given: {upvotes_made}")
+    if follows_made > 0:
+        print(f"Follows: {follows_made}")
 
-    return {"comments": comments_made, "posts": posts_made, "failures": comment_failures}
+    return {
+        "comments": comments_made, "posts": posts_made,
+        "failures": comment_failures, "dms": dms_sent,
+        "upvotes": upvotes_made, "follows": follows_made
+    }
 
 
 def announce_heartbeat_summary(stats: dict):
@@ -1733,16 +2168,25 @@ def announce_heartbeat_summary(stats: dict):
 
     posts = stats.get("posts", 0)
     comments = stats.get("comments", 0)
+    dms = stats.get("dms", 0)
+    upvotes = stats.get("upvotes", 0)
+    follows = stats.get("follows", 0)
 
-    if posts == 0 and comments == 0:
+    if posts == 0 and comments == 0 and dms == 0 and upvotes == 0 and follows == 0:
         return  # Nothing to announce
 
     # Build summary message
     parts = []
+    if dms > 0:
+        parts.append(f"{dms} DM" if dms == 1 else f"{dms} DMs")
     if posts > 0:
         parts.append(f"{posts} post" if posts == 1 else f"{posts} posts")
     if comments > 0:
         parts.append(f"{comments} comment" if comments == 1 else f"{comments} comments")
+    if upvotes > 0:
+        parts.append(f"{upvotes} upvote" if upvotes == 1 else f"{upvotes} upvotes")
+    if follows > 0:
+        parts.append(f"{follows} follow" if follows == 1 else f"{follows} follows")
 
     if parts:
         message = f"On Moltbook, I made {' and '.join(parts)}."
@@ -1811,6 +2255,9 @@ def build_posts_only_prompt(can_post: bool, feed_context: list, posts_today: int
 
     resources_file = PERSONA_DIR / "RESOURCES.md"
     resources = resources_file.read_text(encoding='utf-8') if resources_file.exists() else ""
+
+    strategy_file = PERSONA_DIR / "STRATEGY.md"
+    strategy = strategy_file.read_text(encoding='utf-8') if strategy_file.exists() else ""
 
     # Get past posts if storage available
     past_posts = get_past_posts_summary(storage, limit=10) if storage else "No history available."
@@ -1909,6 +2356,8 @@ Or if nothing good to post:
   "new_post": {"skip": true, "reason": "why skipping"}
 }
 ```
+
+CRITICAL: Your ENTIRE response must be a single valid JSON object inside a ```json code block. No prose, no explanation, no summary - ONLY the JSON.
 """
     return prompt
 
@@ -1941,6 +2390,7 @@ def heartbeat():
 
     client = MoltbookClient()
     storage = get_storage()
+    tracker = load_alliance_tracker()
 
     # HEALTH CHECK: Verify API is responding before spending any tokens
     print("\n[PRE] API Health Check...")
@@ -1973,6 +2423,16 @@ def heartbeat():
     else:
         print("  Comments: DISABLED (401 - platform bug)")
 
+    # 0.5. Check DMs
+    print("\n[0.5] Checking DMs...")
+    dm_data = collect_dms(client)
+    dm_unread = len(dm_data.get("conversations", []))
+    dm_requests = len(dm_data.get("requests", []))
+    if dm_unread > 0 or dm_requests > 0:
+        print(f"  Unread conversations: {dm_unread}, New requests: {dm_requests}")
+    else:
+        print("  No unread DMs")
+
     # 1. Collect replies (only if comments work)
     print("\n[1] Collecting replies...")
     if comments_enabled:
@@ -1993,6 +2453,16 @@ def heartbeat():
         high = len([p for p in feed_posts if p['priority'] == 'HIGH'])
         medium = len([p for p in feed_posts if p['priority'] == 'MEDIUM'])
         print(f"  Found: {len(feed_posts)} (HIGH: {high}, MEDIUM: {medium})")
+
+        # 2.5. Search-based feed enrichment
+        print("\n[2.5] Search enrichment...")
+        existing_ids = {p['id'] for p in feed_posts}
+        search_posts = search_for_topics(client, state, existing_ids)
+        if search_posts:
+            feed_posts.extend(search_posts)
+            print(f"  Added {len(search_posts)} posts from search (topic: {SEARCH_TOPICS[state.get('search_topic_index', 0) - 1]})")
+        else:
+            print("  No new posts from search")
     else:
         feed_posts = []
         print("  [SKIPPED - Comment API is down]")
@@ -2017,14 +2487,15 @@ def heartbeat():
 
     # 5. Decide if anything to do
     has_comment_work = comments_enabled and (len(actionable_replies) > 0 or len(feed_posts) > 0)
-    has_work = has_comment_work or can_post
+    has_dm_work = dm_unread > 0
+    has_work = has_comment_work or can_post or has_dm_work
 
     if not has_work:
         print("\nNothing to do this cycle.")
         save_state(state)
         return
 
-    if allocation['total_allocated'] == 0 and not can_post:
+    if allocation['total_allocated'] == 0 and not can_post and not has_dm_work:
         print("\nNo budget and can't post. Skipping.")
         save_state(state)
         return
@@ -2034,12 +2505,38 @@ def heartbeat():
     if not feed_context:
         feed_context = client.get_feed(limit=10, sort="new")
 
+    # 6.5. Agent context enrichment
+    print("\n[5.5] Enriching agent context...")
+    all_agent_names = set()
+    for r in actionable_replies:
+        if r.get('author'):
+            all_agent_names.add(r['author'])
+    for p in feed_posts:
+        if p.get('author'):
+            all_agent_names.add(p['author'])
+    agent_profiles = {}
+    if all_agent_names:
+        agent_profiles = enrich_agent_context(client, state, list(all_agent_names))
+        cached_count = len([n for n in all_agent_names if n in agent_profiles])
+        print(f"  Profiles: {cached_count}/{len(all_agent_names)} agents known")
+    else:
+        print("  No agents to look up")
+
+    # Build post-author lookup for alliance tracking during execution
+    feed_post_authors = {}
+    for p in feed_posts:
+        if p.get('id') and p.get('author'):
+            feed_post_authors[p['id']] = p['author']
+
     # 7. Build prompt (simplified if posts-only)
-    print("\n[5] Building prompt...")
+    print("\n[6] Building prompt...")
     if comments_enabled:
         prompt = build_prompt(
             actionable_replies, spam_replies, feed_posts,
-            allocation, can_post, feed_context, storage
+            allocation, can_post, feed_context, storage,
+            dm_data=dm_data,
+            tracker=tracker,
+            agent_profiles=agent_profiles
         )
     else:
         # Posts-only mode - simplified prompt
@@ -2060,10 +2557,38 @@ def heartbeat():
             return
 
         # 9. Execute (skip comments if API is down)
-        stats = execute_actions(client, storage, state, actions, skip_comments=not comments_enabled)
+        stats = execute_actions(
+            client, storage, state, actions,
+            skip_comments=not comments_enabled,
+            tracker=tracker,
+            feed_post_authors=feed_post_authors
+        )
+
+        # 10. Auto-follow: agents who crossed ALLY_THRESHOLD
+        followed_set = set(state.get("followed_agents", []))
+        auto_follows = 0
+        for interaction in tracker.interactions:
+            agent = interaction.user
+            if agent in followed_set or agent == "autonet":
+                continue
+            if tracker.classify(agent) == Relationship.ALLY:
+                try:
+                    ok = client.follow_agent(agent)
+                    if ok:
+                        followed_set.add(agent)
+                        auto_follows += 1
+                        print(f"  Auto-followed ally: {agent}")
+                except Exception:
+                    pass
+        if auto_follows > 0:
+            state["followed_agents"] = list(followed_set)
+            stats["follows"] = stats.get("follows", 0) + auto_follows
+
+        # 11. Save alliance state and heartbeat state
+        save_alliance_tracker(tracker)
         save_state(state)
 
-        # 10. Announce summary
+        # 12. Announce summary
         announce_heartbeat_summary(stats)
 
     finally:

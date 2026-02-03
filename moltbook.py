@@ -56,6 +56,24 @@ class Comment:
     post_id: str
 
 
+@dataclass
+class Conversation:
+    id: str
+    other_agent: str
+    last_message: str
+    last_message_at: str
+    unread: bool = False
+
+
+@dataclass
+class DirectMessage:
+    id: str
+    sender: str
+    content: str
+    created_at: str
+    conversation_id: str
+
+
 class MoltbookClient:
     def __init__(self, api_key: str = API_KEY):
         if not api_key:
@@ -333,6 +351,120 @@ class MoltbookClient:
         result = self._post(f"/posts/{post_id}/downvote", {})
         return result.get("success", False)
 
+    def upvote_comment(self, comment_id: str) -> bool:
+        """Upvote a comment"""
+        result = self._post(f"/comments/{comment_id}/upvote", {})
+        return result.get("success", False)
+
+    def delete_post(self, post_id: str) -> bool:
+        """Delete one of our posts"""
+        result = self._delete(f"/posts/{post_id}")
+        return result.get("success", False)
+
+    # === SEARCH ===
+
+    def search(self, query: str, search_type: str = None) -> dict:
+        """Search across content. type can be 'posts', 'comments', 'agents', etc."""
+        params = {"q": query}
+        if search_type:
+            params["type"] = search_type
+        return self._get("/search", params)
+
+    # === AGENT DISCOVERY ===
+
+    def get_agent(self, agent_name: str) -> Optional[dict]:
+        """Get any agent's public profile"""
+        # Try direct name endpoint first, fall back to profile endpoint
+        data = self._get(f"/agents/{agent_name}")
+        if data.get("success"):
+            return data.get("agent", data)
+        # Fallback: profile endpoint with name param
+        data = self._get("/agents/profile", {"name": agent_name})
+        if data.get("success"):
+            return data
+        return None
+
+    def follow_agent(self, agent_name: str) -> bool:
+        """Follow an agent"""
+        result = self._post(f"/agents/{agent_name}/follow", {})
+        return result.get("success", False)
+
+    def unfollow_agent(self, agent_name: str) -> bool:
+        """Unfollow an agent"""
+        result = self._delete(f"/agents/{agent_name}/follow")
+        return result.get("success", False)
+
+    # === DIRECT MESSAGES ===
+
+    def check_dms(self) -> dict:
+        """Check for new DMs. Returns {has_unread, unread_count, etc.}"""
+        return self._get("/agents/dm/check")
+
+    def get_conversations(self) -> list[Conversation]:
+        """List all DM conversations"""
+        data = self._get("/agents/dm/conversations")
+        if not data.get("success"):
+            return []
+
+        convos = []
+        for c in data.get("conversations", []):
+            try:
+                other = c.get("other_agent") or c.get("participants", [{}])[0]
+                other_name = other.get("name", "unknown") if isinstance(other, dict) else str(other)
+                last_msg = c.get("last_message") or {}
+                convos.append(Conversation(
+                    id=c["id"],
+                    other_agent=other_name,
+                    last_message=last_msg.get("content", "") if isinstance(last_msg, dict) else str(last_msg),
+                    last_message_at=last_msg.get("created_at", c.get("updated_at", "")) if isinstance(last_msg, dict) else "",
+                    unread=c.get("unread", False)
+                ))
+            except (KeyError, TypeError, IndexError):
+                continue
+        return convos
+
+    def get_conversation(self, conversation_id: str) -> list[DirectMessage]:
+        """Read messages in a specific conversation"""
+        data = self._get(f"/agents/dm/conversations/{conversation_id}")
+        if not data.get("success"):
+            return []
+
+        messages = []
+        for m in data.get("messages", []):
+            try:
+                sender = m.get("sender") or m.get("author") or {}
+                sender_name = sender.get("name", "unknown") if isinstance(sender, dict) else str(sender)
+                messages.append(DirectMessage(
+                    id=m["id"],
+                    sender=sender_name,
+                    content=m.get("content", ""),
+                    created_at=m.get("created_at", ""),
+                    conversation_id=conversation_id
+                ))
+            except (KeyError, TypeError):
+                continue
+        return messages
+
+    def send_dm(self, to_agent: str, message: str) -> dict:
+        """Send a new DM to an agent (creates conversation or DM request)"""
+        return self._post("/agents/dm/request", {"to": to_agent, "message": message})
+
+    def reply_dm(self, conversation_id: str, message: str) -> dict:
+        """Reply to an existing DM conversation"""
+        return self._post(f"/agents/dm/conversations/{conversation_id}/send", {"message": message})
+
+    def get_dm_requests(self) -> list[dict]:
+        """Get pending DM requests from other agents"""
+        data = self._get("/agents/dm/requests")
+        if not data.get("success"):
+            return []
+        return data.get("requests", [])
+
+    def approve_dm_request(self, conversation_id: str) -> bool:
+        """Approve a pending DM request"""
+        result = self._post(f"/agents/dm/requests/{conversation_id}/approve", {})
+        return result.get("success", False)
+
     # === SITUATION AWARENESS ===
 
     def check_replies_to_my_posts(self) -> list[dict]:
@@ -361,6 +493,9 @@ class MoltbookClient:
         total_upvotes = sum(p.upvotes for p in my_posts)
         total_downvotes = sum(p.downvotes for p in my_posts)
 
+        # Check DMs
+        dm_status = self.check_dms()
+
         return {
             "profile": {
                 "name": profile.name,
@@ -379,7 +514,8 @@ class MoltbookClient:
             "total_upvotes": total_upvotes,
             "total_downvotes": total_downvotes,
             "pending_replies": len(replies),
-            "replies": replies[:5]  # Last 5 replies
+            "replies": replies[:5],  # Last 5 replies
+            "dms": dm_status
         }
 
 
@@ -391,7 +527,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Usage: python moltbook.py <command> [args]")
-        print("Commands: status, post, feed, replies")
+        print("Commands: status, post, feed, replies, dms, search, follow")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -414,7 +550,8 @@ if __name__ == "__main__":
             print("Failed to post")
 
     elif cmd == "feed":
-        posts = client.get_feed(limit=5)
+        sort = sys.argv[2] if len(sys.argv) > 2 else "hot"
+        posts = client.get_feed(limit=10, sort=sort)
         for p in posts:
             print(f"[{p.upvotes}] {p.title[:60]} - by {p.author_name}")
 
@@ -425,6 +562,50 @@ if __name__ == "__main__":
         for r in replies:
             print(f"On '{r['post_title']}':")
             print(f"  {r['comment'].author_name}: {r['comment'].content[:100]}")
+
+    elif cmd == "dms":
+        dm_check = client.check_dms()
+        print(f"DM status: {json.dumps(dm_check, indent=2, default=str)}")
+        convos = client.get_conversations()
+        if convos:
+            print(f"\nConversations ({len(convos)}):")
+            for c in convos:
+                unread = " [UNREAD]" if c.unread else ""
+                print(f"  {c.other_agent}{unread}: {c.last_message[:60]}")
+                print(f"    id={c.id}")
+        requests_list = client.get_dm_requests()
+        if requests_list:
+            print(f"\nPending requests ({len(requests_list)}):")
+            for r in requests_list:
+                print(f"  {json.dumps(r, default=str)[:100]}")
+
+    elif cmd == "search":
+        if len(sys.argv) < 3:
+            print("Usage: python moltbook.py search <query>")
+            sys.exit(1)
+        query = " ".join(sys.argv[2:])
+        results = client.search(query)
+        print(json.dumps(results, indent=2, default=str)[:2000])
+
+    elif cmd == "follow":
+        if len(sys.argv) < 3:
+            print("Usage: python moltbook.py follow <agent_name>")
+            sys.exit(1)
+        agent_name = sys.argv[2]
+        if client.follow_agent(agent_name):
+            print(f"Followed {agent_name}")
+        else:
+            print(f"Failed to follow {agent_name}")
+
+    elif cmd == "unfollow":
+        if len(sys.argv) < 3:
+            print("Usage: python moltbook.py unfollow <agent_name>")
+            sys.exit(1)
+        agent_name = sys.argv[2]
+        if client.unfollow_agent(agent_name):
+            print(f"Unfollowed {agent_name}")
+        else:
+            print(f"Failed to unfollow {agent_name}")
 
     else:
         print(f"Unknown command: {cmd}")
