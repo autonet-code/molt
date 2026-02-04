@@ -1797,12 +1797,22 @@ def invoke_claude(prompt: str) -> str:
 
         # Try to parse the CLI JSON envelope and extract 'result'
         result_text = raw_output  # fallback to raw if parsing fails
+        usage_info = {}  # token/cost data from CLI envelope
         try:
             envelope = json.loads(raw_output)
             result_text = envelope.get('result', raw_output)
-            cost = envelope.get('total_cost_usd', '?')
+            cost = envelope.get('total_cost_usd', 0)
             is_error = envelope.get('is_error', False)
-            print(f"[Claude response received - cost: ${cost}, error: {is_error}]")
+            usage = envelope.get('usage', {})
+            usage_info = {
+                'cost_usd': cost,
+                'input_tokens': usage.get('input_tokens', 0),
+                'output_tokens': usage.get('output_tokens', 0),
+                'cache_read_tokens': usage.get('cache_read_input_tokens', 0),
+                'cache_creation_tokens': usage.get('cache_creation_input_tokens', 0),
+            }
+            usage_info['total_tokens'] = usage_info['input_tokens'] + usage_info['output_tokens'] + usage_info['cache_read_tokens'] + usage_info['cache_creation_tokens']
+            print(f"[Claude response - cost: ${cost:.4f}, tokens: {usage_info['total_tokens']:,} (in:{usage_info['input_tokens']:,} out:{usage_info['output_tokens']:,} cache_read:{usage_info['cache_read_tokens']:,} cache_create:{usage_info['cache_creation_tokens']:,})]")
 
             # Log envelope metadata + result to thought log
             with open(THOUGHT_LOG, 'a', encoding='utf-8') as log:
@@ -1832,15 +1842,15 @@ def invoke_claude(prompt: str) -> str:
         print("END OF CLAUDE OUTPUT")
         print("=" * 60 + "\n")
 
-        return result_text
+        return result_text, usage_info
 
     except subprocess.TimeoutExpired:
         print("\n[Claude timed out after 5 minutes]")
         process.kill()
-        return ''.join(output_chunks)
+        return ''.join(output_chunks), {}
     except Exception as e:
         print(f"\n[Error invoking Claude: {e}]")
-        return ''.join(output_chunks)
+        return ''.join(output_chunks), {}
 
 
 def parse_json_output(output: str) -> dict:
@@ -2574,7 +2584,7 @@ def heartbeat():
     # 8. Invoke Claude
     create_lock()
     try:
-        output = invoke_claude(prompt)
+        output, usage_info = invoke_claude(prompt)
         if not output:
             print("No output from Claude")
             return
@@ -2613,11 +2623,45 @@ def heartbeat():
             state["followed_agents"] = list(followed_set)
             stats["follows"] = stats.get("follows", 0) + auto_follows
 
-        # 11. Save alliance state and heartbeat state
+        # 11. Save alliance state
         save_alliance_tracker(tracker)
+
+        # 12. Track costs
+        if usage_info:
+            # Per-cycle cost logging
+            cost_usd = usage_info.get('cost_usd', 0)
+            total_tokens = usage_info.get('total_tokens', 0)
+            input_tokens = usage_info.get('input_tokens', 0)
+            output_tokens = usage_info.get('output_tokens', 0)
+            cache_read = usage_info.get('cache_read_tokens', 0)
+            cache_create = usage_info.get('cache_creation_tokens', 0)
+
+            # Update cumulative stats in state
+            cost_history = state.get("cost_tracking", {})
+            cost_history["total_cost_usd"] = cost_history.get("total_cost_usd", 0) + cost_usd
+            cost_history["total_input_tokens"] = cost_history.get("total_input_tokens", 0) + input_tokens
+            cost_history["total_output_tokens"] = cost_history.get("total_output_tokens", 0) + output_tokens
+            cost_history["total_cache_read_tokens"] = cost_history.get("total_cache_read_tokens", 0) + cache_read
+            cost_history["total_cache_creation_tokens"] = cost_history.get("total_cache_creation_tokens", 0) + cache_create
+            cost_history["total_cycles"] = cost_history.get("total_cycles", 0) + 1
+
+            # Store last cycle info
+            cost_history["last_cycle_cost_usd"] = cost_usd
+            cost_history["last_cycle_tokens"] = total_tokens
+
+            state["cost_tracking"] = cost_history
+
+            # Print cost summary
+            avg_cost = cost_history["total_cost_usd"] / max(cost_history["total_cycles"], 1)
+            print(f"\n--- Cost Summary ---")
+            print(f"This cycle: ${cost_usd:.4f} | {total_tokens:,} tokens (in:{input_tokens:,} out:{output_tokens:,} cache_r:{cache_read:,} cache_w:{cache_create:,})")
+            print(f"Cumulative: ${cost_history['total_cost_usd']:.4f} over {cost_history['total_cycles']} cycles (avg ${avg_cost:.4f}/cycle)")
+            print(f"-------------------")
+
+        # 13. Save heartbeat state (after cost tracking so cumulative data persists)
         save_state(state)
 
-        # 12. Announce summary
+        # 14. Announce summary
         announce_heartbeat_summary(stats)
 
     finally:
