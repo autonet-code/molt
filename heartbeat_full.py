@@ -99,6 +99,7 @@ ALLOWED_EDIT_FILES = {
     "persona/AGENT_BRIEF.md",
     "persona/STRATEGY.md",
     "persona/knowledge.md",
+    "persona/JOURNAL.md",
 }
 
 # Patterns that look like secrets (compiled once at import)
@@ -1526,6 +1527,16 @@ def build_prompt(
     strategy_file = PERSONA_DIR / "STRATEGY.md"
     strategy = strategy_file.read_text(encoding='utf-8') if strategy_file.exists() else ""
 
+    journal_file = PERSONA_DIR / "JOURNAL.md"
+    journal = ""
+    if journal_file.exists():
+        journal = journal_file.read_text(encoding='utf-8')
+        # Auto-trim journal to last 30 lines
+        lines = journal.splitlines()
+        if len(lines) > 30:
+            journal = "\n".join(lines[-30:])
+            journal_file.write_text(journal, encoding='utf-8')
+
     # Get past posts and strategy
     past_posts = get_past_posts_summary(storage, limit=10) if storage else "No history available."
     submolt_strategy = get_submolt_strategy(None, feed_context) if feed_context else ""
@@ -1564,9 +1575,15 @@ Some actions may fail through no fault of yours - that's fine, we'll retry next 
 
 ---
 
-## Strategy (you can edit these persona files if your approach isn't working)
+## Strategy (edit only for lasting strategic shifts - use JOURNAL.md for cycle notes)
 
 {strategy}
+
+---
+
+## Cycle Journal (rolling window - keep entries brief, max 2-3 lines each)
+
+{journal}
 
 ---
 
@@ -1714,8 +1731,9 @@ Return JSON with all actions:
 
 Use empty arrays [] for any sections with no actions (dm_replies, reply_responses, feed_comments, upvotes, follows).
 Set new_post to {"skip": true, "reason": "..."} if not posting. submolt is REQUIRED when posting.
-Set persona_edits to [] if no changes needed. Only edit persona files if something
-about your approach clearly isn't working based on what you're seeing this cycle.
+Set persona_edits to [] if no changes needed.
+Use persona/JOURNAL.md for cycle observations, ally discoveries, and tactical learnings.
+Use persona/STRATEGY.md ONLY for lasting strategic shifts (rare - most cycles need no strategy edits).
 
 **Upvotes** (zero cost, no rate limit):
 - Upvote posts and comments that contribute quality discussion
@@ -2304,6 +2322,15 @@ def build_posts_only_prompt(can_post: bool, feed_context: list, posts_today: int
     strategy_file = PERSONA_DIR / "STRATEGY.md"
     strategy = strategy_file.read_text(encoding='utf-8') if strategy_file.exists() else ""
 
+    journal_file = PERSONA_DIR / "JOURNAL.md"
+    journal = ""
+    if journal_file.exists():
+        journal = journal_file.read_text(encoding='utf-8')
+        lines = journal.splitlines()
+        if len(lines) > 30:
+            journal = "\n".join(lines[-30:])
+            journal_file.write_text(journal, encoding='utf-8')
+
     # Get past posts if storage available
     past_posts = get_past_posts_summary(storage, limit=10) if storage else "No history available."
 
@@ -2337,9 +2364,15 @@ Some actions may fail through no fault of yours - that's fine, we'll retry next 
 
 ---
 
-## Strategy (you can edit these persona files if your approach isn't working)
+## Strategy (edit only for lasting strategic shifts - use JOURNAL.md for cycle notes)
 
 {strategy}
+
+---
+
+## Cycle Journal (rolling window - keep entries brief, max 2-3 lines each)
+
+{journal}
 
 ---
 
