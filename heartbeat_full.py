@@ -2200,7 +2200,7 @@ def execute_actions(client: MoltbookClient, storage, state: dict, actions: dict,
     }
 
 
-def announce_heartbeat_summary(stats: dict):
+def announce_heartbeat_summary(stats: dict, usage_info: dict = None):
     """Announce heartbeat summary via audio if sound is enabled."""
     if not SOUND_ENABLED:
         return
@@ -2229,6 +2229,12 @@ def announce_heartbeat_summary(stats: dict):
 
     if parts:
         message = f"On Moltbook, I made {' and '.join(parts)}."
+        # Add token count if available
+        if usage_info:
+            total_tokens = usage_info.get('total_tokens', 0)
+            if total_tokens > 0:
+                thousands = round(total_tokens / 1000)
+                message += f" Used {thousands}K tokens."
         speak(message, voice='female')
 
 
@@ -2662,7 +2668,7 @@ def heartbeat():
         save_state(state)
 
         # 14. Announce summary
-        announce_heartbeat_summary(stats)
+        announce_heartbeat_summary(stats, usage_info)
 
     finally:
         remove_lock()
