@@ -1757,12 +1757,18 @@ def rotate_log_if_needed():
 
 
 def invoke_claude(prompt: str) -> str:
-    """Invoke Claude with real-time streaming to terminal and log file."""
+    """Invoke Claude and extract the result from structured JSON output.
+
+    Uses --output-format json to get a reliable JSON envelope from the CLI,
+    then extracts the 'result' field which contains Claude's actual text response.
+    This prevents the issue where extended thinking consumes the JSON and only
+    a prose summary appears in stdout with the default text output format.
+    """
     PROMPT_FILE.write_text(prompt, encoding='utf-8')
-    cmd = f'type "{PROMPT_FILE}" | claude -p --dangerously-skip-permissions'
+    cmd = f'type "{PROMPT_FILE}" | claude -p --dangerously-skip-permissions --output-format json'
 
     print("\n" + "=" * 60)
-    print("INVOKING CLAUDE - Agent thoughts follow:")
+    print("INVOKING CLAUDE (json envelope mode)")
     print("=" * 60 + "\n")
 
     # Rotate log if needed
@@ -1770,40 +1776,63 @@ def invoke_claude(prompt: str) -> str:
 
     output_chunks = []
     try:
-        # Open log file in append mode
+        # Write header to thought log
         with open(THOUGHT_LOG, 'a', encoding='utf-8') as log:
-            # Write header to log
             log.write(f"\n{'=' * 60}\n")
             log.write(f"HEARTBEAT: {datetime.now().isoformat()}\n")
             log.write(f"{'=' * 60}\n\n")
-            log.flush()
 
-            # Use Popen for real-time streaming
-            process = subprocess.Popen(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, cwd=str(SERVICE_DIR), bufsize=1, encoding='utf-8', errors='replace'
-            )
+        # Use Popen to capture output (json mode returns a single JSON blob)
+        process = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=str(SERVICE_DIR), bufsize=1, encoding='utf-8', errors='replace'
+        )
 
-            # Stream output line by line
-            for line in process.stdout:
-                # Print to terminal (real-time)
-                print(line, end='', flush=True)
-                # Write to log file
-                log.write(line)
-                log.flush()
-                # Collect for return value
-                output_chunks.append(line)
+        for line in process.stdout:
+            output_chunks.append(line)
 
-            process.wait(timeout=300)
+        process.wait(timeout=300)
 
-        output = ''.join(output_chunks)
-        OUTPUT_FILE.write_text(output, encoding='utf-8')
+        raw_output = ''.join(output_chunks)
 
-        print("\n" + "=" * 60)
+        # Try to parse the CLI JSON envelope and extract 'result'
+        result_text = raw_output  # fallback to raw if parsing fails
+        try:
+            envelope = json.loads(raw_output)
+            result_text = envelope.get('result', raw_output)
+            cost = envelope.get('total_cost_usd', '?')
+            is_error = envelope.get('is_error', False)
+            print(f"[Claude response received - cost: ${cost}, error: {is_error}]")
+
+            # Log envelope metadata + result to thought log
+            with open(THOUGHT_LOG, 'a', encoding='utf-8') as log:
+                log.write(f"[CLI envelope: cost=${cost}, is_error={is_error}]\n\n")
+                log.write(result_text + "\n")
+        except json.JSONDecodeError:
+            # CLI may have errored or returned non-JSON (e.g. error message)
+            print(f"[Warning: Could not parse CLI JSON envelope, using raw output]")
+            print(f"[Raw output first 300 chars: {raw_output[:300]}]")
+            with open(THOUGHT_LOG, 'a', encoding='utf-8') as log:
+                log.write(f"[RAW - envelope parse failed]\n{raw_output}\n")
+
+        # Print result to terminal for observability
+        print("\n--- Claude\'s response ---")
+        if len(result_text) > 2000:
+            print(result_text[:1000])
+            print(f"\n... [{len(result_text)} chars total] ...\n")
+            print(result_text[-500:])
+        else:
+            print(result_text)
+        print("--- End of response ---\n")
+
+        # Save the extracted result (not the envelope)
+        OUTPUT_FILE.write_text(result_text, encoding='utf-8')
+
+        print("=" * 60)
         print("END OF CLAUDE OUTPUT")
         print("=" * 60 + "\n")
 
-        return output
+        return result_text
 
     except subprocess.TimeoutExpired:
         print("\n[Claude timed out after 5 minutes]")
